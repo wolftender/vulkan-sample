@@ -1,6 +1,8 @@
+#include "glm/ext/matrix_transform.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -14,9 +16,12 @@
 #pragma clang diagnostic ignored "-Weverything"
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vk_enum_string_helper.h>
+
 #include <GLFW/glfw3.h>
 
 #include "third_party/VkBootstrap.h"
@@ -377,6 +382,11 @@ struct Geometry {
     std::vector<uint16_t> indices;
 };
 
+struct cbPerFrame {
+    glm::fmat4 view;
+    glm::fmat4 proj;
+};
+
 struct SceneState final {
 public:
     struct FrameSubmitData final {
@@ -388,11 +398,21 @@ public:
         VkSemaphore sem_image_avaliable_, sem_render_done_;
         VkFence fence_in_flight_;
 
+        VkDescriptorSet per_frame_set_;
+        Buffer per_frame_buffer_;
+
         FrameSubmitData(ProgramState &state, SceneState &scene)
             : state_{state}, scene_{scene}, command_buffer_{VK_NULL_HANDLE}, sem_image_avaliable_{VK_NULL_HANDLE},
-              sem_render_done_{VK_NULL_HANDLE}, fence_in_flight_{VK_NULL_HANDLE} {}
+              sem_render_done_{VK_NULL_HANDLE}, fence_in_flight_{VK_NULL_HANDLE}, per_frame_set_{VK_NULL_HANDLE} {}
 
     public:
+        VkCommandBuffer command_buffer() { return command_buffer_; }
+        Buffer &per_frame_buffer() { return per_frame_buffer_; }
+
+        void update_per_frame(const cbPerFrame &data) {
+            memcpy(per_frame_buffer_.alloc_info().pMappedData, &data, sizeof(cbPerFrame));
+        }
+
         FrameSubmitData(const FrameSubmitData &) = delete;
         FrameSubmitData &operator=(const FrameSubmitData &) = delete;
 
@@ -401,11 +421,14 @@ public:
             sem_image_avaliable_ = f.sem_image_avaliable_;
             sem_render_done_ = f.sem_render_done_;
             fence_in_flight_ = f.fence_in_flight_;
+            per_frame_set_ = f.per_frame_set_;
+            per_frame_buffer_ = std::move(f.per_frame_buffer_);
 
             f.command_buffer_ = VK_NULL_HANDLE;
             f.sem_image_avaliable_ = VK_NULL_HANDLE;
             f.sem_render_done_ = VK_NULL_HANDLE;
             f.fence_in_flight_ = VK_NULL_HANDLE;
+            f.per_frame_set_ = VK_NULL_HANDLE;
         }
 
         ~FrameSubmitData() {
@@ -424,6 +447,10 @@ public:
     VkPipeline graphics_pipeline_;
     VkCommandPool command_pool_;
 
+    // descriptor set layouts
+    VkDescriptorPool descriptor_pool_;
+    VkDescriptorSetLayout layout_per_frame_;
+
     // resource uploading
     Buffer staging_buffer_;
     VkCommandBuffer upload_buffer_;
@@ -440,7 +467,7 @@ private:
     SceneState(ProgramState &state)
         : state_{state}, graphics_queue_{VK_NULL_HANDLE}, present_queue_{VK_NULL_HANDLE}, render_pass_{VK_NULL_HANDLE},
           pipeline_layout_{VK_NULL_HANDLE}, graphics_pipeline_{VK_NULL_HANDLE}, command_pool_{VK_NULL_HANDLE},
-          current_frame_{0} {}
+          descriptor_pool_{VK_NULL_HANDLE}, layout_per_frame_{VK_NULL_HANDLE}, current_frame_{0} {}
     SceneState(const SceneState &) = delete;
     SceneState &operator=(const SceneState &) = delete;
 
@@ -489,6 +516,8 @@ public:
 
         state_.swapchain().destroy_image_views(swapchain_views_);
 
+        state_.dispatch().destroyDescriptorPool(descriptor_pool_, nullptr);
+        state_.dispatch().destroyDescriptorSetLayout(layout_per_frame_, nullptr);
         state_.dispatch().destroyCommandPool(command_pool_, nullptr);
         state_.dispatch().destroyRenderPass(render_pass_, nullptr);
         state_.dispatch().destroyPipelineLayout(pipeline_layout_, nullptr);
@@ -592,6 +621,8 @@ public:
 
         state_.dispatch().cmdBeginRenderPass(frame.command_buffer_, &render_begin_desc, VK_SUBPASS_CONTENTS_INLINE);
         state_.dispatch().cmdBindPipeline(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_);
+        state_.dispatch().cmdBindDescriptorSets(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipeline_layout_, 0, 1, &frame.per_frame_set_, 0, nullptr);
 
         // dynamic state
         VkViewport vp{};
@@ -607,7 +638,7 @@ public:
         state_.dispatch().cmdSetViewport(frame.command_buffer_, 0, 1, &vp);
         state_.dispatch().cmdSetScissor(frame.command_buffer_, 0, 1, &scissor);
 
-        res = draw_commands(frame.command_buffer_);
+        res = draw_commands(frame);
         if (VK_SUCCESS != res) {
             LOG_ERROR("draw_commands returned %s", string_VkResult(res));
             return false;
@@ -662,6 +693,34 @@ public:
 
         current_frame_ = current_frame_ % static_cast<uint32_t>(frame_data_.size());
         return true;
+    }
+
+    std::optional<Buffer> create_shared_buffer(const VkBufferUsageFlags usage, size_t byte_size) const {
+        VkResult res;
+
+        VkBufferCreateInfo create_info{};
+        create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        create_info.size = byte_size;
+        create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        create_info.usage = usage;
+
+        VmaAllocationCreateInfo alloc_create_info{};
+        alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO;
+        alloc_create_info.flags =
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+        VkBuffer vk_buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = VMA_NULL;
+        VmaAllocationInfo alloc_info{};
+
+        res =
+            vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("cannot create buffer: %s", string_VkResult(res));
+            return {};
+        }
+
+        return Buffer{state_.allocator(), vk_buffer, allocation, alloc_info};
     }
 
     std::optional<Buffer> create_buffer(
@@ -875,16 +934,55 @@ public:
         return true;
     }
 
-    static bool create_pipeline_layout(ProgramState &state, VkPipelineLayout *layout) {
+    static bool create_descriptor_data(ProgramState &state, SceneState &scene) {
+        VkDescriptorSetLayoutBinding per_frame_binding{};
+        per_frame_binding.binding = 0;
+        per_frame_binding.descriptorCount = 1;
+        per_frame_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        per_frame_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        VkDescriptorSetLayoutCreateInfo set_info{};
+        set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set_info.bindingCount = 1;
+        set_info.flags = 0;
+        set_info.pBindings = &per_frame_binding;
+
+        VkResult res = state.dispatch().createDescriptorSetLayout(&set_info, nullptr, &scene.layout_per_frame_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to create descriptor set layout: %s", string_VkResult(res));
+            return false;
+        }
+
+        // allocate descriptor pool
+        std::array<VkDescriptorPoolSize, 1> pool_sizes = {VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 100}};
+
+        VkDescriptorPoolCreateInfo pool_desc{};
+        pool_desc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_desc.flags = 0;
+        pool_desc.maxSets = 100;
+        pool_desc.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
+        pool_desc.pPoolSizes = pool_sizes.data();
+
+        res = state.dispatch().createDescriptorPool(&pool_desc, nullptr, &scene.descriptor_pool_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to allocate descriptor pool: %s", string_VkResult(res));
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool create_pipeline_layout(ProgramState &state, SceneState &scene) {
         VkPipelineLayoutCreateInfo pipeline_layout_info = {};
         pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipeline_layout_info.setLayoutCount = 0;
+        pipeline_layout_info.setLayoutCount = 1;
+        pipeline_layout_info.pSetLayouts = &scene.layout_per_frame_;
         pipeline_layout_info.pushConstantRangeCount = 0;
 
         VkResult res;
-        res = state.dispatch().createPipelineLayout(&pipeline_layout_info, nullptr, layout);
+        res = state.dispatch().createPipelineLayout(&pipeline_layout_info, nullptr, &scene.pipeline_layout_);
         if (VK_SUCCESS != res) {
-            *layout = VK_NULL_HANDLE;
+            scene.pipeline_layout_ = VK_NULL_HANDLE;
             LOG_ERROR("failed to pipeline layout: %s", string_VkResult(res));
             return false;
         }
@@ -1140,6 +1238,44 @@ public:
                 LOG_ERROR("failed to create fence: %s", string_VkResult(res));
                 return false;
             }
+
+            // allocate per frame ubo data
+            auto buffer = scene.create_shared_buffer(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, sizeof(cbPerFrame));
+            if (!buffer) {
+                LOG_ERROR("failed allocating shared buffer");
+                return false;
+            }
+
+            frame.per_frame_buffer_ = std::move(buffer.value());
+
+            // allocate descriptor set
+            VkDescriptorSetAllocateInfo set_alloc_info{};
+            set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            set_alloc_info.descriptorPool = scene.descriptor_pool_;
+            set_alloc_info.descriptorSetCount = 1;
+            set_alloc_info.pSetLayouts = &scene.layout_per_frame_;
+
+            res = state.dispatch().allocateDescriptorSets(&set_alloc_info, &frame.per_frame_set_);
+            if (VK_SUCCESS != res) {
+                LOG_ERROR("failed to allocate per frame descriptor set: %s", string_VkResult(res));
+                return false;
+            }
+
+            // point the descriptor set to the buffer
+            VkDescriptorBufferInfo buffer_info{};
+            buffer_info.buffer = frame.per_frame_buffer_.buffer();
+            buffer_info.offset = 0;
+            buffer_info.range = sizeof(cbPerFrame);
+
+            VkWriteDescriptorSet write_set{};
+            write_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write_set.dstBinding = 0;
+            write_set.dstSet = frame.per_frame_set_;
+            write_set.descriptorCount = 1;
+            write_set.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            write_set.pBufferInfo = &buffer_info;
+
+            state.dispatch().updateDescriptorSets(1, &write_set, 0, nullptr);
         }
 
         return true;
@@ -1180,7 +1316,14 @@ public:
 
         LOG_INFO("created the swapchain framebuffers");
 
-        if (!create_pipeline_layout(state, &scene->pipeline_layout_)) {
+        if (!create_descriptor_data(state, *scene)) {
+            LOG_ERROR("failed to initialize descriptor data");
+            return {};
+        }
+
+        LOG_INFO("descriptor data initialized");
+
+        if (!create_pipeline_layout(state, *scene)) {
             LOG_ERROR("failed to create pipeline layout");
             return {};
         }
@@ -1221,31 +1364,43 @@ public:
 
 struct VulkanSample final {
 private:
-    VulkanSample(ProgramState &state, SceneState &scene) : state{state}, scene{scene} {};
+    ProgramState &state_;
+    SceneState &scene_;
+
+    Geometry geometry_;
+    Buffer vertex_buffer_;
+    Buffer index_buffer_;
+
+    cbPerFrame per_frame_;
+
+    VulkanSample(ProgramState &state, SceneState &scene) : state_{state}, scene_{scene} {}
 
 public:
-    ProgramState &state;
-    SceneState &scene;
-
-    Geometry geometry;
-    Buffer vertex_buffer;
-    Buffer index_buffer;
-
     VulkanSample(const VulkanSample &) = delete;
     ~VulkanSample() {
         LOG_INFO("destroying sample state");
 
-        VkResult res = state.dispatch().deviceWaitIdle();
+        VkResult res = state_.dispatch().deviceWaitIdle();
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to wait device idle: %s", string_VkResult(res));
         }
     }
 
-    VkResult record_queue(VkCommandBuffer command_buffer) {
+    VkResult record_queue(SceneState::FrameSubmitData &frame) {
+        float aspect =
+            static_cast<float>(state_.swapchain().extent.width) / static_cast<float>(state_.swapchain().extent.height);
+
+        per_frame_.view =
+            glm::lookAt(glm::fvec3{5.0f, 5.0f, 5.0f}, glm::fvec3{0.0f, 0.0f, 0.0f}, glm::fvec3{0.0f, 1.0f, 0.0f});
+        per_frame_.proj = glm::perspective(glm::pi<float>() * 0.25f, aspect, 0.5f, 50.0f);
+        per_frame_.proj[1][1] *= -1.0f;
+
+        frame.update_per_frame(per_frame_);
+
         VkDeviceSize buf_offset = 0;
-        state.dispatch().cmdBindVertexBuffers(command_buffer, 0, 1, vertex_buffer.addr_of(), &buf_offset);
-        state.dispatch().cmdBindIndexBuffer(command_buffer, index_buffer.buffer(), 0, VK_INDEX_TYPE_UINT16);
-        state.dispatch().cmdDrawIndexed(command_buffer, geometry.indices.size(), 1, 0, 0, 0);
+        state_.dispatch().cmdBindVertexBuffers(frame.command_buffer(), 0, 1, vertex_buffer_.addr_of(), &buf_offset);
+        state_.dispatch().cmdBindIndexBuffer(frame.command_buffer(), index_buffer_.buffer(), 0, VK_INDEX_TYPE_UINT16);
+        state_.dispatch().cmdDrawIndexed(frame.command_buffer(), geometry_.indices.size(), 1, 0, 0, 0);
 
         return VK_SUCCESS;
     }
@@ -1353,9 +1508,9 @@ return Geometry{
 
         LOG_INFO("index buffer upload complete");
 
-        sample->geometry = std::move(geometry);
-        sample->vertex_buffer = std::move(vertex_buffer.value());
-        sample->index_buffer = std::move(index_buffer.value());
+        sample->geometry_ = std::move(geometry);
+        sample->vertex_buffer_ = std::move(vertex_buffer.value());
+        sample->index_buffer_ = std::move(index_buffer.value());
 
         return sample;
     }
@@ -1395,9 +1550,9 @@ int main(int argc, char **argv) {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        if (!scene_state->draw_frame([&](VkCommandBuffer buffer) -> VkResult {
+        if (!scene_state->draw_frame([&](SceneState::FrameSubmitData &frame) -> VkResult {
             // allow the sample to record its command queue
-            return sample->record_queue(buffer);
+            return sample->record_queue(frame);
         })) {
             LOG_ERROR("a fatal error has occured while rendering a frame");
             return EXIT_FAILURE;
