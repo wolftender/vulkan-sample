@@ -181,36 +181,53 @@ public:
 
 struct ProgramState final {
 private:
-    ProgramState() : surface{VK_NULL_HANDLE}, allocator{VMA_NULL} {};
+    vkb::Instance instance_;
+    vkb::InstanceDispatchTable instance_dispatch_;
+    VkSurfaceKHR surface_;
+    vkb::PhysicalDevice phys_dev_;
+    vkb::Device device_;
+    vkb::DispatchTable dispatch_;
+    vkb::Swapchain swapchain_;
+
+    // memory allocation
+    VmaVulkanFunctions allocator_fns_;
+    VmaAllocator allocator_;
+
+    ProgramState() : surface_{VK_NULL_HANDLE}, allocator_{VMA_NULL} {};
     ProgramState(const ProgramState &) = delete;
     ProgramState &operator=(const ProgramState) = delete;
 
 public:
-    vkb::Instance instance;
-    vkb::InstanceDispatchTable instance_dispatch;
-    VkSurfaceKHR surface;
-    vkb::PhysicalDevice phys_dev;
-    vkb::Device device;
-    vkb::DispatchTable dispatch;
-    vkb::Swapchain swapchain;
+    VkSurfaceKHR surface() const { return surface_; }
+    VmaAllocator allocator() const { return allocator_; }
 
-    // memory allocation
-    VmaVulkanFunctions allocator_fns;
-    VmaAllocator allocator;
+    const vkb::Instance &instance() const { return instance_; }
+    const vkb::InstanceDispatchTable &instance_dispatch() const { return instance_dispatch_; }
+    const vkb::PhysicalDevice &phys_dev() const { return phys_dev_; }
+    const vkb::Device &device() const { return device_; }
+    const vkb::DispatchTable &dispatch() const { return dispatch_; }
+    const vkb::Swapchain &swapchain() const { return swapchain_; }
+
+    vkb::Instance &instance() { return instance_; }
+    vkb::InstanceDispatchTable &instance_dispatch() { return instance_dispatch_; }
+    vkb::PhysicalDevice &phys_dev() { return phys_dev_; }
+    vkb::Device &device() { return device_; }
+    vkb::DispatchTable &dispatch() { return dispatch_; }
+    vkb::Swapchain &swapchain() { return swapchain_; }
 
     ~ProgramState() {
         LOG_INFO("freeing program state");
 
-        vmaDestroyAllocator(allocator);
-        vkb::destroy_swapchain(swapchain);
-        vkb::destroy_device(device);
-        vkb::destroy_surface(instance, surface);
-        vkb::destroy_instance(instance);
+        vmaDestroyAllocator(allocator_);
+        vkb::destroy_swapchain(swapchain_);
+        vkb::destroy_device(device_);
+        vkb::destroy_surface(instance_, surface_);
+        vkb::destroy_instance(instance_);
     }
 
     bool init_swapchain() {
-        vkb::SwapchainBuilder builder{device};
-        builder.set_old_swapchain(swapchain);
+        vkb::SwapchainBuilder builder{device_};
+        builder.set_old_swapchain(swapchain_);
 
         auto ret = builder.build();
         if (!ret) {
@@ -218,8 +235,8 @@ public:
             return false;
         }
 
-        vkb::destroy_swapchain(swapchain);
-        swapchain = ret.value();
+        vkb::destroy_swapchain(swapchain_);
+        swapchain_ = ret.value();
 
         return true;
     }
@@ -283,14 +300,14 @@ public:
             return {};
         }
 
-        state->instance = instance_ret.value();
-        state->instance_dispatch = state->instance.make_table();
+        state->instance_ = instance_ret.value();
+        state->instance_dispatch_ = state->instance_.make_table();
 
         // create surface from window
-        state->surface = make_surface_glfw(state->instance, window);
+        state->surface_ = make_surface_glfw(state->instance_, window);
 
-        vkb::PhysicalDeviceSelector phys_dev_selector{state->instance};
-        auto devices_ret = phys_dev_selector.set_surface(state->surface).select_devices();
+        vkb::PhysicalDeviceSelector phys_dev_selector{state->instance_};
+        auto devices_ret = phys_dev_selector.set_surface(state->surface_).select_devices();
 
         if (!devices_ret) {
             LOG_ERROR("device enumeration failed: %s", devices_ret.error().message().c_str());
@@ -301,10 +318,10 @@ public:
             LOG_INFO("detected vk device: %s", device.name.c_str());
         }
 
-        state->phys_dev = devices_ret.value().front();
-        LOG_INFO("selected vk device: %s", state->phys_dev.name.c_str());
+        state->phys_dev_ = devices_ret.value().front();
+        LOG_INFO("selected vk device: %s", state->phys_dev_.name.c_str());
 
-        vkb::DeviceBuilder device_builder{state->phys_dev};
+        vkb::DeviceBuilder device_builder{state->phys_dev_};
         auto device_ret = device_builder.build();
 
         if (!device_ret) {
@@ -312,8 +329,8 @@ public:
             return {};
         }
 
-        state->device = device_ret.value();
-        state->dispatch = state->device.make_table();
+        state->device_ = device_ret.value();
+        state->dispatch_ = state->device_.make_table();
 
         LOG_INFO("created vk device successfully");
 
@@ -323,19 +340,19 @@ public:
         }
 
         // init vma
-        state->allocator_fns = {};
-        state->allocator_fns.vkGetInstanceProcAddr = state->instance.fp_vkGetInstanceProcAddr;
-        state->allocator_fns.vkGetDeviceProcAddr = state->instance.fp_vkGetDeviceProcAddr;
+        state->allocator_fns_ = {};
+        state->allocator_fns_.vkGetInstanceProcAddr = state->instance_.fp_vkGetInstanceProcAddr;
+        state->allocator_fns_.vkGetDeviceProcAddr = state->instance_.fp_vkGetDeviceProcAddr;
 
         VmaAllocatorCreateInfo alloc_create_info{};
         alloc_create_info.flags = 0;
         alloc_create_info.vulkanApiVersion = VK_API_VERSION_1_0;
-        alloc_create_info.physicalDevice = state->phys_dev;
-        alloc_create_info.instance = state->instance;
-        alloc_create_info.device = state->device;
-        alloc_create_info.pVulkanFunctions = &state->allocator_fns;
+        alloc_create_info.physicalDevice = state->phys_dev_;
+        alloc_create_info.instance = state->instance_;
+        alloc_create_info.device = state->device_;
+        alloc_create_info.pVulkanFunctions = &state->allocator_fns_;
 
-        VkResult res = vmaCreateAllocator(&alloc_create_info, &state->allocator);
+        VkResult res = vmaCreateAllocator(&alloc_create_info, &state->allocator_);
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to create allocator: %s", string_VkResult(res));
             return {};
@@ -361,34 +378,92 @@ struct Geometry {
 };
 
 struct SceneState final {
+public:
+    struct FrameSubmitData final {
+    private:
+        ProgramState &state_;
+        SceneState &scene_;
+
+        VkCommandBuffer command_buffer_;
+        VkSemaphore sem_image_avaliable_, sem_render_done_;
+        VkFence fence_in_flight_;
+
+        FrameSubmitData(ProgramState &state, SceneState &scene)
+            : state_{state}, scene_{scene}, command_buffer_{VK_NULL_HANDLE}, sem_image_avaliable_{VK_NULL_HANDLE},
+              sem_render_done_{VK_NULL_HANDLE}, fence_in_flight_{VK_NULL_HANDLE} {}
+
+    public:
+        FrameSubmitData(const FrameSubmitData &) = delete;
+        FrameSubmitData &operator=(const FrameSubmitData &) = delete;
+
+        FrameSubmitData(FrameSubmitData &&f) : state_{f.state_}, scene_{f.scene_} {
+            command_buffer_ = f.command_buffer_;
+            sem_image_avaliable_ = f.sem_image_avaliable_;
+            sem_render_done_ = f.sem_render_done_;
+            fence_in_flight_ = f.fence_in_flight_;
+
+            f.command_buffer_ = VK_NULL_HANDLE;
+            f.sem_image_avaliable_ = VK_NULL_HANDLE;
+            f.sem_render_done_ = VK_NULL_HANDLE;
+            f.fence_in_flight_ = VK_NULL_HANDLE;
+        }
+
+        ~FrameSubmitData() {
+            state_.dispatch().destroySemaphore(sem_image_avaliable_, nullptr);
+            state_.dispatch().destroySemaphore(sem_render_done_, nullptr);
+            state_.dispatch().destroyFence(fence_in_flight_, nullptr);
+        }
+
+        friend struct SceneState;
+    };
+
+    ProgramState &state_;
+    VkQueue graphics_queue_, present_queue_;
+    VkRenderPass render_pass_;
+    VkPipelineLayout pipeline_layout_;
+    VkPipeline graphics_pipeline_;
+    VkCommandPool command_pool_;
+
+    // resource uploading
+    Buffer staging_buffer_;
+    VkCommandBuffer upload_buffer_;
+
+    std::vector<VkImage> swapchain_images_;
+    std::vector<VkImageView> swapchain_views_;
+    std::vector<VkFramebuffer> swapchain_fbs_;
+    std::vector<FrameSubmitData> frame_data_;
+
+    // currently rendered frame out of frames in flight
+    uint32_t current_frame_;
+
 private:
     SceneState(ProgramState &state)
-        : state{state}, graphics_queue{VK_NULL_HANDLE}, present_queue{VK_NULL_HANDLE}, render_pass{VK_NULL_HANDLE},
-          pipeline_layout{VK_NULL_HANDLE}, graphics_pipeline{VK_NULL_HANDLE}, command_pool{VK_NULL_HANDLE},
-          current_frame{0} {}
+        : state_{state}, graphics_queue_{VK_NULL_HANDLE}, present_queue_{VK_NULL_HANDLE}, render_pass_{VK_NULL_HANDLE},
+          pipeline_layout_{VK_NULL_HANDLE}, graphics_pipeline_{VK_NULL_HANDLE}, command_pool_{VK_NULL_HANDLE},
+          current_frame_{0} {}
     SceneState(const SceneState &) = delete;
     SceneState &operator=(const SceneState &) = delete;
 
     bool create_framebuffers() {
-        swapchain_images = state.swapchain.get_images().value();
-        swapchain_views = state.swapchain.get_image_views().value();
+        swapchain_images_ = state_.swapchain().get_images().value();
+        swapchain_views_ = state_.swapchain().get_image_views().value();
 
         VkResult res;
 
-        swapchain_fbs.resize(swapchain_views.size());
-        for (size_t i = 0; i < swapchain_views.size(); ++i) {
-            VkImageView attachments[] = {swapchain_views[i]};
+        swapchain_fbs_.resize(swapchain_views_.size());
+        for (size_t i = 0; i < swapchain_views_.size(); ++i) {
+            VkImageView attachments[] = {swapchain_views_[i]};
 
             VkFramebufferCreateInfo framebuffer_info = {};
             framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-            framebuffer_info.renderPass = render_pass;
+            framebuffer_info.renderPass = render_pass_;
             framebuffer_info.attachmentCount = 1;
             framebuffer_info.pAttachments = attachments;
-            framebuffer_info.width = state.swapchain.extent.width;
-            framebuffer_info.height = state.swapchain.extent.height;
+            framebuffer_info.width = state_.swapchain().extent.width;
+            framebuffer_info.height = state_.swapchain().extent.height;
             framebuffer_info.layers = 1;
 
-            res = state.dispatch.createFramebuffer(&framebuffer_info, nullptr, &swapchain_fbs[i]);
+            res = state_.dispatch().createFramebuffer(&framebuffer_info, nullptr, &swapchain_fbs_[i]);
 
             if (VK_SUCCESS != res) {
                 LOG_ERROR("failed to create swapchain fb: %s", string_VkResult(res));
@@ -400,100 +475,43 @@ private:
     }
 
 public:
-    struct FrameSubmitData final {
-        ProgramState &state;
-        SceneState &scene;
-
-        VkCommandBuffer command_buffer;
-        VkSemaphore sem_image_avaliable, sem_render_done;
-        VkFence fence_in_flight;
-
-    private:
-        FrameSubmitData(ProgramState &state, SceneState &scene)
-            : state{state}, scene{scene}, command_buffer{VK_NULL_HANDLE}, sem_image_avaliable{VK_NULL_HANDLE},
-              sem_render_done{VK_NULL_HANDLE}, fence_in_flight{VK_NULL_HANDLE} {}
-
-    public:
-        FrameSubmitData(const FrameSubmitData &) = delete;
-        FrameSubmitData &operator=(const FrameSubmitData &) = delete;
-
-        FrameSubmitData(FrameSubmitData &&f) : state{f.state}, scene{f.scene} {
-            command_buffer = f.command_buffer;
-            sem_image_avaliable = f.sem_image_avaliable;
-            sem_render_done = f.sem_render_done;
-            fence_in_flight = f.fence_in_flight;
-
-            f.command_buffer = VK_NULL_HANDLE;
-            f.sem_image_avaliable = VK_NULL_HANDLE;
-            f.sem_render_done = VK_NULL_HANDLE;
-            f.fence_in_flight = VK_NULL_HANDLE;
-        }
-
-        ~FrameSubmitData() {
-            state.dispatch.destroySemaphore(sem_image_avaliable, nullptr);
-            state.dispatch.destroySemaphore(sem_render_done, nullptr);
-            state.dispatch.destroyFence(fence_in_flight, nullptr);
-        }
-
-        friend struct SceneState;
-    };
-
-    ProgramState &state;
-    VkQueue graphics_queue, present_queue;
-    VkRenderPass render_pass;
-    VkPipelineLayout pipeline_layout;
-    VkPipeline graphics_pipeline;
-    VkCommandPool command_pool;
-
-    // resource uploading
-    Buffer staging_buffer;
-    VkCommandBuffer upload_buffer;
-
-    std::vector<VkImage> swapchain_images;
-    std::vector<VkImageView> swapchain_views;
-    std::vector<VkFramebuffer> swapchain_fbs;
-    std::vector<FrameSubmitData> frame_data;
-
-    // currently rendered frame out of frames in flight
-    uint32_t current_frame;
-
     ~SceneState() {
-        VkResult res = state.dispatch.deviceWaitIdle();
+        VkResult res = state_.dispatch().deviceWaitIdle();
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to wait device idle: %s", string_VkResult(res));
         }
 
         LOG_INFO("destroying the scene state");
 
-        for (auto &fb : swapchain_fbs) {
-            state.dispatch.destroyFramebuffer(fb, nullptr);
+        for (auto &fb : swapchain_fbs_) {
+            state_.dispatch().destroyFramebuffer(fb, nullptr);
         }
 
-        state.swapchain.destroy_image_views(swapchain_views);
+        state_.swapchain().destroy_image_views(swapchain_views_);
 
-        state.dispatch.destroyCommandPool(command_pool, nullptr);
-        state.dispatch.destroyRenderPass(render_pass, nullptr);
-        state.dispatch.destroyPipelineLayout(pipeline_layout, nullptr);
-        state.dispatch.destroyPipeline(graphics_pipeline, nullptr);
+        state_.dispatch().destroyCommandPool(command_pool_, nullptr);
+        state_.dispatch().destroyRenderPass(render_pass_, nullptr);
+        state_.dispatch().destroyPipelineLayout(pipeline_layout_, nullptr);
+        state_.dispatch().destroyPipeline(graphics_pipeline_, nullptr);
     }
 
     bool rebuild_swapchain() {
         LOG_INFO("rebuilding swapchain");
 
-        if (!swapchain_fbs.empty()) {
-            state.dispatch.deviceWaitIdle();
+        if (!swapchain_fbs_.empty()) {
+            state_.dispatch().deviceWaitIdle();
 
-            for (auto &fb : swapchain_fbs) {
-                state.dispatch.destroyFramebuffer(fb, nullptr);
+            for (auto &fb : swapchain_fbs_) {
+                state_.dispatch().destroyFramebuffer(fb, nullptr);
             }
 
-            state.swapchain.destroy_image_views(swapchain_views);
-            swapchain_images.clear();
-            swapchain_views.clear();
-            swapchain_fbs.clear();
+            state_.swapchain().destroy_image_views(swapchain_views_);
+            swapchain_images_.clear();
+            swapchain_views_.clear();
+            swapchain_fbs_.clear();
         }
 
-        if (!state.init_swapchain()) {
+        if (!state_.init_swapchain()) {
             LOG_ERROR("failed to initialize swapchain");
             return false;
         }
@@ -507,10 +525,10 @@ public:
     }
 
     template <typename F> bool draw_frame(F draw_commands) {
-        auto &frame = frame_data[current_frame];
+        auto &frame = frame_data_[current_frame_];
         VkResult res;
 
-        res = state.dispatch.waitForFences(1, &frame.fence_in_flight, VK_TRUE, UINT64_MAX);
+        res = state_.dispatch().waitForFences(1, &frame.fence_in_flight_, VK_TRUE, UINT64_MAX);
         if (VK_SUCCESS != res) {
             LOG_ERROR("wait for fences failed: %s", string_VkResult(res));
             return false;
@@ -518,8 +536,8 @@ public:
 
         uint32_t image_index;
         {
-            res = state.dispatch.acquireNextImageKHR(
-                state.swapchain, UINT64_MAX, frame.sem_image_avaliable, VK_NULL_HANDLE, &image_index);
+            res = state_.dispatch().acquireNextImageKHR(
+                state_.swapchain(), UINT64_MAX, frame.sem_image_avaliable_, VK_NULL_HANDLE, &image_index);
 
             switch (res) {
             case VK_SUCCESS:
@@ -534,13 +552,13 @@ public:
         }
 
         // only reset the fence if any work will be submitted
-        res = state.dispatch.resetFences(1, &frame.fence_in_flight);
+        res = state_.dispatch().resetFences(1, &frame.fence_in_flight_);
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to reset frames in flight fence: %s", string_VkResult(res));
             return false;
         }
 
-        res = state.dispatch.resetCommandBuffer(frame.command_buffer, 0);
+        res = state_.dispatch().resetCommandBuffer(frame.command_buffer_, 0);
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to reset command buffer: %s", string_VkResult(res));
             return false;
@@ -552,7 +570,7 @@ public:
         cmd_begin_desc.flags = 0;
         cmd_begin_desc.pInheritanceInfo = nullptr;
 
-        res = state.dispatch.beginCommandBuffer(frame.command_buffer, &cmd_begin_desc);
+        res = state_.dispatch().beginCommandBuffer(frame.command_buffer_, &cmd_begin_desc);
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to begin command buffer: %s", string_VkResult(res));
             return false;
@@ -566,37 +584,37 @@ public:
 
         VkRenderPassBeginInfo render_begin_desc{};
         render_begin_desc.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        render_begin_desc.renderPass = render_pass;
-        render_begin_desc.framebuffer = swapchain_fbs[image_index];
-        render_begin_desc.renderArea = VkRect2D{{0, 0}, state.swapchain.extent};
+        render_begin_desc.renderPass = render_pass_;
+        render_begin_desc.framebuffer = swapchain_fbs_[image_index];
+        render_begin_desc.renderArea = VkRect2D{{0, 0}, state_.swapchain().extent};
         render_begin_desc.pClearValues = &clear_value;
         render_begin_desc.clearValueCount = 1;
 
-        state.dispatch.cmdBeginRenderPass(frame.command_buffer, &render_begin_desc, VK_SUBPASS_CONTENTS_INLINE);
-        state.dispatch.cmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline);
+        state_.dispatch().cmdBeginRenderPass(frame.command_buffer_, &render_begin_desc, VK_SUBPASS_CONTENTS_INLINE);
+        state_.dispatch().cmdBindPipeline(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_);
 
         // dynamic state
         VkViewport vp{};
-        vp.width = state.swapchain.extent.width;
-        vp.height = state.swapchain.extent.height;
+        vp.width = state_.swapchain().extent.width;
+        vp.height = state_.swapchain().extent.height;
         vp.x = 0;
         vp.y = 0;
         vp.minDepth = 0.0f;
         vp.maxDepth = 1.0f;
 
-        VkRect2D scissor{{0, 0}, state.swapchain.extent};
+        VkRect2D scissor{{0, 0}, state_.swapchain().extent};
 
-        state.dispatch.cmdSetViewport(frame.command_buffer, 0, 1, &vp);
-        state.dispatch.cmdSetScissor(frame.command_buffer, 0, 1, &scissor);
+        state_.dispatch().cmdSetViewport(frame.command_buffer_, 0, 1, &vp);
+        state_.dispatch().cmdSetScissor(frame.command_buffer_, 0, 1, &scissor);
 
-        res = draw_commands(frame.command_buffer);
+        res = draw_commands(frame.command_buffer_);
         if (VK_SUCCESS != res) {
             LOG_ERROR("draw_commands returned %s", string_VkResult(res));
             return false;
         }
 
-        state.dispatch.cmdEndRenderPass(frame.command_buffer);
-        state.dispatch.endCommandBuffer(frame.command_buffer);
+        state_.dispatch().cmdEndRenderPass(frame.command_buffer_);
+        state_.dispatch().endCommandBuffer(frame.command_buffer_);
 
         // submitting the recorder buffer
         VkPipelineStageFlags wait_mask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -604,26 +622,26 @@ public:
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.pWaitDstStageMask = &wait_mask;
-        submit_info.pWaitSemaphores = &frame.sem_image_avaliable;
+        submit_info.pWaitSemaphores = &frame.sem_image_avaliable_;
         submit_info.waitSemaphoreCount = 1;
-        submit_info.pCommandBuffers = &frame.command_buffer;
+        submit_info.pCommandBuffers = &frame.command_buffer_;
         submit_info.commandBufferCount = 1;
-        submit_info.pSignalSemaphores = &frame.sem_render_done;
+        submit_info.pSignalSemaphores = &frame.sem_render_done_;
         submit_info.signalSemaphoreCount = 1;
 
-        state.dispatch.queueSubmit(graphics_queue, 1, &submit_info, frame.fence_in_flight);
+        state_.dispatch().queueSubmit(graphics_queue_, 1, &submit_info, frame.fence_in_flight_);
 
         VkPresentInfoKHR present_info{};
         present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        present_info.pWaitSemaphores = &frame.sem_render_done;
+        present_info.pWaitSemaphores = &frame.sem_render_done_;
         present_info.waitSemaphoreCount = 1;
         present_info.pImageIndices = &image_index;
-        present_info.pSwapchains = &state.swapchain.swapchain;
+        present_info.pSwapchains = &state_.swapchain().swapchain;
         present_info.swapchainCount = 1;
 
         // present
         {
-            res = state.dispatch.queuePresentKHR(present_queue, &present_info);
+            res = state_.dispatch().queuePresentKHR(present_queue_, &present_info);
             switch (res) {
             case VK_ERROR_OUT_OF_DATE_KHR:
             case VK_SUBOPTIMAL_KHR:
@@ -642,7 +660,7 @@ public:
             }
         }
 
-        current_frame = current_frame % static_cast<uint32_t>(frame_data.size());
+        current_frame_ = current_frame_ % static_cast<uint32_t>(frame_data_.size());
         return true;
     }
 
@@ -684,13 +702,14 @@ public:
         VmaAllocation allocation = VMA_NULL;
         VmaAllocationInfo alloc_info{};
 
-        res = vmaCreateBuffer(state.allocator, &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
+        res =
+            vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
         if (VK_SUCCESS != res) {
             LOG_ERROR("cannot create buffer: %s", string_VkResult(res));
             return {};
         }
 
-        Buffer buffer{state.allocator, vk_buffer, allocation, alloc_info};
+        Buffer buffer{state_.allocator(), vk_buffer, allocation, alloc_info};
 
         // check if can be mapped on host, not always use_staging = cannot be mapped
         auto mem_prop_flags = buffer.mem_prop_flags();
@@ -700,39 +719,39 @@ public:
             // memory is host visible, we can memcpy into it
 
             void *mapped_mem;
-            res = vmaMapMemory(state.allocator, buffer.allocation(), &mapped_mem);
+            res = vmaMapMemory(state_.allocator(), buffer.allocation(), &mapped_mem);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("cannot map buffer: %s", string_VkResult(res));
                 return {};
             }
 
             memcpy(mapped_mem, data, byte_size);
-            vmaUnmapMemory(state.allocator, buffer.allocation());
+            vmaUnmapMemory(state_.allocator(), buffer.allocation());
 
-            res = vmaFlushAllocation(state.allocator, buffer.allocation(), 0, VK_WHOLE_SIZE);
+            res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("vmaFlushAllocation failure: %s", string_VkResult(res));
                 return {};
             }
         } else {
             void *mapped_mem;
-            res = vmaMapMemory(state.allocator, staging_buffer.allocation(), &mapped_mem);
+            res = vmaMapMemory(state_.allocator(), staging_buffer_.allocation(), &mapped_mem);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("cannot map staging buffer: %s", string_VkResult(res));
                 return {};
             }
 
             memcpy(mapped_mem, data, byte_size);
-            vmaUnmapMemory(state.allocator, staging_buffer.allocation());
+            vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
 
             // transfer command
-            res = vmaFlushAllocation(state.allocator, buffer.allocation(), 0, VK_WHOLE_SIZE);
+            res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("vmaFlushAllocation failure: %s", string_VkResult(res));
                 return {};
             }
 
-            copy_buffer(staging_buffer.buffer(), buffer.buffer(), byte_size);
+            copy_buffer(staging_buffer_.buffer(), buffer.buffer(), byte_size);
         }
 
         return std::move(buffer);
@@ -740,7 +759,7 @@ public:
 
     bool copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) const {
         VkResult res;
-        res = state.dispatch.resetCommandBuffer(upload_buffer, 0);
+        res = state_.dispatch().resetCommandBuffer(upload_buffer_, 0);
         if (VK_SUCCESS != res) {
             LOG_ERROR("reset upload command buffer failure: %s", string_VkResult(res));
             return false;
@@ -751,7 +770,7 @@ public:
         begin_info.pInheritanceInfo = 0;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-        res = state.dispatch.beginCommandBuffer(upload_buffer, &begin_info);
+        res = state_.dispatch().beginCommandBuffer(upload_buffer_, &begin_info);
         if (VK_SUCCESS != res) {
             LOG_ERROR("begin upload command buffer failure: %s", string_VkResult(res));
             return false;
@@ -762,8 +781,8 @@ public:
         copy_info.dstOffset = 0;
         copy_info.size = size;
 
-        state.dispatch.cmdCopyBuffer(upload_buffer, src, dst, 1, &copy_info);
-        res = state.dispatch.endCommandBuffer(upload_buffer);
+        state_.dispatch().cmdCopyBuffer(upload_buffer_, src, dst, 1, &copy_info);
+        res = state_.dispatch().endCommandBuffer(upload_buffer_);
         if (VK_SUCCESS != res) {
             LOG_ERROR("end upload command buffer failure: %s", string_VkResult(res));
             return false;
@@ -771,16 +790,16 @@ public:
 
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit_info.pCommandBuffers = &upload_buffer;
+        submit_info.pCommandBuffers = &upload_buffer_;
         submit_info.commandBufferCount = 1;
 
-        res = state.dispatch.queueSubmit(graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
+        res = state_.dispatch().queueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE);
         if (VK_SUCCESS != res) {
             LOG_ERROR("submit upload command buffer failure: %s", string_VkResult(res));
             return false;
         }
 
-        res = state.dispatch.deviceWaitIdle();
+        res = state_.dispatch().deviceWaitIdle();
         if (VK_SUCCESS != res) {
             LOG_ERROR("wait device idle failure: %s", string_VkResult(res));
             return false;
@@ -798,7 +817,7 @@ public:
         create_info.pCode = reinterpret_cast<const uint32_t *>(buffer);
 
         VkShaderModule module = VK_NULL_HANDLE;
-        res = state.dispatch.createShaderModule(&create_info, nullptr, &module);
+        res = state.dispatch().createShaderModule(&create_info, nullptr, &module);
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to create shader module: %s", string_VkResult(res));
             return VK_NULL_HANDLE;
@@ -809,7 +828,7 @@ public:
 
     static bool create_render_pass(ProgramState &state, VkRenderPass *render_pass) {
         VkAttachmentDescription color_attachment = {};
-        color_attachment.format = state.swapchain.image_format;
+        color_attachment.format = state.swapchain().image_format;
         color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
         color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -846,7 +865,7 @@ public:
         render_pass_info.dependencyCount = 1;
         render_pass_info.pDependencies = &dependency;
 
-        VkResult res = state.dispatch.createRenderPass(&render_pass_info, nullptr, render_pass);
+        VkResult res = state.dispatch().createRenderPass(&render_pass_info, nullptr, render_pass);
         if (VK_SUCCESS != res) {
             *render_pass = VK_NULL_HANDLE;
             LOG_ERROR("failed to create render pass: %s", string_VkResult(res));
@@ -863,7 +882,7 @@ public:
         pipeline_layout_info.pushConstantRangeCount = 0;
 
         VkResult res;
-        res = state.dispatch.createPipelineLayout(&pipeline_layout_info, nullptr, layout);
+        res = state.dispatch().createPipelineLayout(&pipeline_layout_info, nullptr, layout);
         if (VK_SUCCESS != res) {
             *layout = VK_NULL_HANDLE;
             LOG_ERROR("failed to pipeline layout: %s", string_VkResult(res));
@@ -887,7 +906,7 @@ public:
         VkShaderModule fs_module = shader_from_bytecode(state, kFragment_spv.data(), kFragment_spv.size());
         if (fs_module == VK_NULL_HANDLE) {
             LOG_ERROR("fatal error when creating fragment shader module");
-            state.dispatch.destroyShaderModule(vs_module, nullptr);
+            state.dispatch().destroyShaderModule(vs_module, nullptr);
             return false;
         }
 
@@ -999,11 +1018,11 @@ public:
         create_info.renderPass = render_pass;
         create_info.subpass = subpass_index;
 
-        VkResult res = state.dispatch.createGraphicsPipelines(VK_NULL_HANDLE, 1, &create_info, nullptr, pipeline);
+        VkResult res = state.dispatch().createGraphicsPipelines(VK_NULL_HANDLE, 1, &create_info, nullptr, pipeline);
 
         // cleanup
-        state.dispatch.destroyShaderModule(vs_module, nullptr);
-        state.dispatch.destroyShaderModule(fs_module, nullptr);
+        state.dispatch().destroyShaderModule(vs_module, nullptr);
+        state.dispatch().destroyShaderModule(fs_module, nullptr);
 
         if (VK_SUCCESS != res) {
             *pipeline = VK_NULL_HANDLE;
@@ -1031,22 +1050,22 @@ public:
         VmaAllocationInfo alloc_info{};
 
         VkResult res = vmaCreateBuffer(
-            state.allocator, &staging_buffer_desc, &staging_alloc_desc, &vk_buffer, &allocation, &alloc_info);
+            state.allocator(), &staging_buffer_desc, &staging_alloc_desc, &vk_buffer, &allocation, &alloc_info);
         if (res != VK_SUCCESS) {
             LOG_ERROR("failed to allocate staging buffer: %s", string_VkResult(res));
             return false;
         }
 
-        scene.staging_buffer = Buffer{state.allocator, vk_buffer, allocation, alloc_info};
+        scene.staging_buffer_ = Buffer{state.allocator(), vk_buffer, allocation, alloc_info};
 
         // since we have the staging buffer, we would also like to get the upload command buffer
         VkCommandBufferAllocateInfo cmd_alloc_info{};
         cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc_info.commandPool = scene.command_pool;
+        cmd_alloc_info.commandPool = scene.command_pool_;
         cmd_alloc_info.commandBufferCount = 1;
         cmd_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 
-        res = state.dispatch.allocateCommandBuffers(&cmd_alloc_info, &scene.upload_buffer);
+        res = state.dispatch().allocateCommandBuffers(&cmd_alloc_info, &scene.upload_buffer_);
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to create upload command buffer: %s", string_VkResult(res));
             return false;
@@ -1061,7 +1080,7 @@ public:
         create_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         create_info.queueFamilyIndex = family_index;
 
-        VkResult res = state.dispatch.createCommandPool(&create_info, nullptr, command_pool);
+        VkResult res = state.dispatch().createCommandPool(&create_info, nullptr, command_pool);
         if (VK_SUCCESS != res) {
             *command_pool = VK_NULL_HANDLE;
             LOG_ERROR("failed to create command pool: %s", string_VkResult(res));
@@ -1081,19 +1100,19 @@ public:
 
         VkCommandBufferAllocateInfo buffer_info{};
         buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        buffer_info.commandPool = scene.command_pool;
+        buffer_info.commandPool = scene.command_pool_;
         buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         buffer_info.commandBufferCount = frames_in_flight;
 
-        res = state.dispatch.allocateCommandBuffers(&buffer_info, command_buffers.data());
+        res = state.dispatch().allocateCommandBuffers(&buffer_info, command_buffers.data());
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to create command buffers: %s", string_VkResult(res));
             return false;
         }
 
         for (uint32_t f = 0; f < frames_in_flight; ++f) {
-            scene.frame_data.push_back(FrameSubmitData(state, scene));
-            auto &frame = scene.frame_data.back();
+            scene.frame_data_.push_back(FrameSubmitData(state, scene));
+            auto &frame = scene.frame_data_.back();
 
             VkSemaphoreCreateInfo sem_create_info{};
             sem_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -1102,21 +1121,21 @@ public:
             fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             fence_create_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-            frame.command_buffer = command_buffers[f];
+            frame.command_buffer_ = command_buffers[f];
 
-            res = state.dispatch.createSemaphore(&sem_create_info, nullptr, &frame.sem_image_avaliable);
+            res = state.dispatch().createSemaphore(&sem_create_info, nullptr, &frame.sem_image_avaliable_);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("failed to create semaphore: %s", string_VkResult(res));
                 return false;
             }
 
-            res = state.dispatch.createSemaphore(&sem_create_info, nullptr, &frame.sem_render_done);
+            res = state.dispatch().createSemaphore(&sem_create_info, nullptr, &frame.sem_render_done_);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("failed to create semaphore: %s", string_VkResult(res));
                 return false;
             }
 
-            res = state.dispatch.createFence(&fence_create_info, nullptr, &frame.fence_in_flight);
+            res = state.dispatch().createFence(&fence_create_info, nullptr, &frame.fence_in_flight_);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("failed to create fence: %s", string_VkResult(res));
                 return false;
@@ -1130,8 +1149,8 @@ public:
         std::unique_ptr<SceneState> scene{new SceneState(state)};
 
         // fetch queues
-        auto gq = state.device.get_queue(vkb::QueueType::graphics);
-        auto pq = state.device.get_queue(vkb::QueueType::present);
+        auto gq = state.device().get_queue(vkb::QueueType::graphics);
+        auto pq = state.device().get_queue(vkb::QueueType::present);
 
         if (!gq.has_value()) {
             LOG_ERROR("no graphics queue: %s", gq.error().message().c_str());
@@ -1143,11 +1162,11 @@ public:
             return {};
         }
 
-        scene->graphics_queue = gq.value();
-        scene->present_queue = pq.value();
+        scene->graphics_queue_ = gq.value();
+        scene->present_queue_ = pq.value();
         LOG_INFO("obtained graphics and present queue");
 
-        if (!create_render_pass(state, &scene->render_pass)) {
+        if (!create_render_pass(state, &scene->render_pass_)) {
             LOG_ERROR("failed to create render pass");
             return {};
         }
@@ -1161,13 +1180,13 @@ public:
 
         LOG_INFO("created the swapchain framebuffers");
 
-        if (!create_pipeline_layout(state, &scene->pipeline_layout)) {
+        if (!create_pipeline_layout(state, &scene->pipeline_layout_)) {
             LOG_ERROR("failed to create pipeline layout");
             return {};
         }
 
         if (!create_graphics_pipeline(
-                state, scene->pipeline_layout, scene->render_pass, 0, &scene->graphics_pipeline)) {
+                state, scene->pipeline_layout_, scene->render_pass_, 0, &scene->graphics_pipeline_)) {
             LOG_ERROR("failed to create pipeline");
             return {};
         }
@@ -1175,7 +1194,7 @@ public:
         LOG_INFO("created graphics pipeline");
 
         if (!create_command_pool(
-                state, state.device.get_queue_index(vkb::QueueType::graphics).value(), &scene->command_pool)) {
+                state, state.device().get_queue_index(vkb::QueueType::graphics).value(), &scene->command_pool_)) {
             LOG_ERROR("failed to create command pool");
             return {};
         }
@@ -1216,7 +1235,7 @@ public:
     ~VulkanSample() {
         LOG_INFO("destroying sample state");
 
-        VkResult res = state.dispatch.deviceWaitIdle();
+        VkResult res = state.dispatch().deviceWaitIdle();
         if (VK_SUCCESS != res) {
             LOG_ERROR("failed to wait device idle: %s", string_VkResult(res));
         }
@@ -1224,9 +1243,9 @@ public:
 
     VkResult record_queue(VkCommandBuffer command_buffer) {
         VkDeviceSize buf_offset = 0;
-        state.dispatch.cmdBindVertexBuffers(command_buffer, 0, 1, vertex_buffer.addr_of(), &buf_offset);
-        state.dispatch.cmdBindIndexBuffer(command_buffer, index_buffer.buffer(), 0, VK_INDEX_TYPE_UINT16);
-        state.dispatch.cmdDrawIndexed(command_buffer, geometry.indices.size(), 1, 0, 0, 0);
+        state.dispatch().cmdBindVertexBuffers(command_buffer, 0, 1, vertex_buffer.addr_of(), &buf_offset);
+        state.dispatch().cmdBindIndexBuffer(command_buffer, index_buffer.buffer(), 0, VK_INDEX_TYPE_UINT16);
+        state.dispatch().cmdDrawIndexed(command_buffer, geometry.indices.size(), 1, 0, 0, 0);
 
         return VK_SUCCESS;
     }
