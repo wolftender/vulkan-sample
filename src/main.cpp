@@ -194,15 +194,23 @@ private:
     vkb::DispatchTable dispatch_;
     vkb::Swapchain swapchain_;
 
+    // queues
+    VkQueue graphics_queue_, present_queue_;
+
     // memory allocation
     VmaVulkanFunctions allocator_fns_;
     VmaAllocator allocator_;
 
-    ProgramState() : surface_{VK_NULL_HANDLE}, allocator_{VMA_NULL} {};
+    ProgramState()
+        : surface_{VK_NULL_HANDLE}, allocator_{VMA_NULL}, graphics_queue_{VK_NULL_HANDLE},
+          present_queue_{VK_NULL_HANDLE} {};
     ProgramState(const ProgramState &) = delete;
     ProgramState &operator=(const ProgramState) = delete;
 
 public:
+    VkQueue graphics_queue() const { return graphics_queue_; }
+    VkQueue present_queue() const { return present_queue_; }
+
     VkSurfaceKHR surface() const { return surface_; }
     VmaAllocator allocator() const { return allocator_; }
 
@@ -344,6 +352,24 @@ public:
             return {};
         }
 
+        // fetch queues
+        auto gq = state->device().get_queue(vkb::QueueType::graphics);
+        auto pq = state->device().get_queue(vkb::QueueType::present);
+
+        if (!gq.has_value()) {
+            LOG_ERROR("no graphics queue: %s", gq.error().message().c_str());
+            return {};
+        }
+
+        if (!pq.has_value()) {
+            LOG_ERROR("no present queue: %s", pq.error().message().c_str());
+            return {};
+        }
+
+        state->graphics_queue_ = gq.value();
+        state->present_queue_ = pq.value();
+        LOG_INFO("obtained graphics and present queue");
+
         // init vma
         state->allocator_fns_ = {};
         state->allocator_fns_.vkGetInstanceProcAddr = state->instance_.fp_vkGetInstanceProcAddr;
@@ -441,7 +467,6 @@ public:
     };
 
     ProgramState &state_;
-    VkQueue graphics_queue_, present_queue_;
     VkRenderPass render_pass_;
     VkPipelineLayout pipeline_layout_;
     VkPipeline graphics_pipeline_;
@@ -465,9 +490,9 @@ public:
 
 private:
     SceneState(ProgramState &state)
-        : state_{state}, graphics_queue_{VK_NULL_HANDLE}, present_queue_{VK_NULL_HANDLE}, render_pass_{VK_NULL_HANDLE},
-          pipeline_layout_{VK_NULL_HANDLE}, graphics_pipeline_{VK_NULL_HANDLE}, command_pool_{VK_NULL_HANDLE},
-          descriptor_pool_{VK_NULL_HANDLE}, layout_per_frame_{VK_NULL_HANDLE}, current_frame_{0} {}
+        : state_{state}, render_pass_{VK_NULL_HANDLE}, pipeline_layout_{VK_NULL_HANDLE},
+          graphics_pipeline_{VK_NULL_HANDLE}, command_pool_{VK_NULL_HANDLE}, descriptor_pool_{VK_NULL_HANDLE},
+          layout_per_frame_{VK_NULL_HANDLE}, current_frame_{0} {}
     SceneState(const SceneState &) = delete;
     SceneState &operator=(const SceneState &) = delete;
 
@@ -660,7 +685,7 @@ public:
         submit_info.pSignalSemaphores = &frame.sem_render_done_;
         submit_info.signalSemaphoreCount = 1;
 
-        state_.dispatch().queueSubmit(graphics_queue_, 1, &submit_info, frame.fence_in_flight_);
+        state_.dispatch().queueSubmit(state_.graphics_queue(), 1, &submit_info, frame.fence_in_flight_);
 
         VkPresentInfoKHR present_info{};
         present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -672,7 +697,7 @@ public:
 
         // present
         {
-            res = state_.dispatch().queuePresentKHR(present_queue_, &present_info);
+            res = state_.dispatch().queuePresentKHR(state_.present_queue(), &present_info);
             switch (res) {
             case VK_ERROR_OUT_OF_DATE_KHR:
             case VK_SUBOPTIMAL_KHR:
@@ -852,7 +877,7 @@ public:
         submit_info.pCommandBuffers = &upload_buffer_;
         submit_info.commandBufferCount = 1;
 
-        res = state_.dispatch().queueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE);
+        res = state_.dispatch().queueSubmit(state_.graphics_queue(), 1, &submit_info, VK_NULL_HANDLE);
         if (VK_SUCCESS != res) {
             LOG_ERROR("submit upload command buffer failure: %s", string_VkResult(res));
             return false;
@@ -1283,24 +1308,6 @@ public:
 
     static std::unique_ptr<SceneState> initialize(ProgramState &state) {
         std::unique_ptr<SceneState> scene{new SceneState(state)};
-
-        // fetch queues
-        auto gq = state.device().get_queue(vkb::QueueType::graphics);
-        auto pq = state.device().get_queue(vkb::QueueType::present);
-
-        if (!gq.has_value()) {
-            LOG_ERROR("no graphics queue: %s", gq.error().message().c_str());
-            return {};
-        }
-
-        if (!pq.has_value()) {
-            LOG_ERROR("no present queue: %s", pq.error().message().c_str());
-            return {};
-        }
-
-        scene->graphics_queue_ = gq.value();
-        scene->present_queue_ = pq.value();
-        LOG_INFO("obtained graphics and present queue");
 
         if (!create_render_pass(state, &scene->render_pass_)) {
             LOG_ERROR("failed to create render pass");
