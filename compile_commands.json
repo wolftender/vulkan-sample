@@ -1,0 +1,14 @@
+[
+{
+  "directory": "C:/Users/macie/projects/scratchpad/vkb/build",
+  "command": "C:\\PROGRA~1\\LLVM\\bin\\CLANG_~1.EXE -IC:/VulkanSDK/1.4.304.1/Include -IC:/Users/macie/Git/vcpkg/installed/x64-windows/include -O0 -g -Xclang -gcodeview -std=gnu++17 -D_DEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrtd -o CMakeFiles\\vkbtest.dir\\src\\main.cpp.obj -c C:\\Users\\macie\\projects\\scratchpad\\vkb\\src\\main.cpp",
+  "file": "C:\\Users\\macie\\projects\\scratchpad\\vkb\\src\\main.cpp",
+  "output": "CMakeFiles\\vkbtest.dir\\src\\main.cpp.obj"
+},
+{
+  "directory": "C:/Users/macie/projects/scratchpad/vkb/build",
+  "command": "C:\\PROGRA~1\\LLVM\\bin\\CLANG_~1.EXE -IC:/VulkanSDK/1.4.304.1/Include -IC:/Users/macie/Git/vcpkg/installed/x64-windows/include -O0 -g -Xclang -gcodeview -std=gnu++17 -D_DEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrtd -o CMakeFiles\\vkbtest.dir\\src\\third_party\\VkBootstrap.cpp.obj -c C:\\Users\\macie\\projects\\scratchpad\\vkb\\src\\third_party\\VkBootstrap.cpp",
+  "file": "C:\\Users\\macie\\projects\\scratchpad\\vkb\\src\\third_party\\VkBootstrap.cpp",
+  "output": "CMakeFiles\\vkbtest.dir\\src\\third_party\\VkBootstrap.cpp.obj"
+}
+]

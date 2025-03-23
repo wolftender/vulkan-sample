@@ -1,0 +1,5 @@
+out/
+build/
+.vscode/
+.cache/
+src/resources/
