@@ -11,11 +11,11 @@ set(PYTHON_EXECUTABLE py)
 
 include_directories(
     C:/VulkanSDK/1.4.304.1/Include
-    C:/Users/macie/Git/vcpkg/installed/x64-windows/include
+    C:/Users/macie/Git/vcpkg/installed/x64-windows-static/include
 )
 
 link_directories(
-    C:/Users/macie/Git/vcpkg/installed/x64-windows/lib
+    C:/Users/macie/Git/vcpkg/installed/x64-windows-static/lib
 )
 
 # source files
@@ -60,7 +60,7 @@ endforeach()
 
 # add executable
 add_executable(vkbtest ${SOURCE_FILES} ${SHADER_OUTPUTS})
-target_link_libraries(vkbtest glfw3dll)
+target_link_libraries(vkbtest glfw3)
 
 # linking
 # if(WIN32)

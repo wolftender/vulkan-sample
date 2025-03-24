@@ -24,6 +24,7 @@
 
 #include <GLFW/glfw3.h>
 
+#include "third_party/stb_image.h"
 #include "third_party/VkBootstrap.h"
 #include "third_party/VkBootstrapDispatch.h"
 
@@ -76,15 +77,17 @@ public:
     }
 
     Buffer &operator=(Buffer &&b) {
-        destroy();
-        allocator_ = b.allocator_;
-        allocation_ = b.allocation_;
-        alloc_info_ = b.alloc_info_;
-        buffer_ = b.buffer_;
+        if (this != &b) {
+            destroy();
+            allocator_ = b.allocator_;
+            allocation_ = b.allocation_;
+            alloc_info_ = b.alloc_info_;
+            buffer_ = b.buffer_;
 
-        b.allocator_ = VMA_NULL;
-        b.allocation_ = VMA_NULL;
-        b.buffer_ = VK_NULL_HANDLE;
+            b.allocator_ = VMA_NULL;
+            b.allocation_ = VMA_NULL;
+            b.buffer_ = VK_NULL_HANDLE;
+        }
 
         return *this;
     }
@@ -121,6 +124,49 @@ private:
     VkImage image_;
 
 public:
+    struct View final {
+    private:
+        vkb::DispatchTable *dispatch_;
+        VkImageView view_;
+
+        View(vkb::DispatchTable &dispatch, VkImageView view) : dispatch_{&dispatch}, view_{view} {}
+        friend struct Image;
+
+        void destroy() {
+            if (dispatch_ && view_ != VK_NULL_HANDLE) {
+                dispatch_->destroyImageView(view_, nullptr);
+            }
+        }
+
+    public:
+        ~View() { destroy(); }
+        VkImageView view() const { return view_; }
+
+        View(const View &) = delete;
+        View &operator=(const View &) = delete;
+
+        View(View &&v) {
+            view_ = v.view_;
+            dispatch_ = v.dispatch_;
+
+            v.view_ = VK_NULL_HANDLE;
+            v.dispatch_ = nullptr;
+        }
+
+        View &operator=(View &&v) {
+            if (this != &v) {
+                destroy();
+                view_ = v.view_;
+                dispatch_ = v.dispatch_;
+
+                v.view_ = VK_NULL_HANDLE;
+                v.dispatch_ = nullptr;
+            }
+
+            return *this;
+        }
+    };
+
     VmaAllocator allocator() const { return allocator_; }
     VmaAllocation allocation() const { return allocation_; }
     VkImage image() const { return image_; }
@@ -147,17 +193,42 @@ public:
     }
 
     Image &operator=(Image &&i) {
-        destroy();
-        allocator_ = i.allocator_;
-        allocation_ = i.allocation_;
-        alloc_info_ = i.alloc_info_;
-        image_ = i.image_;
+        if (this != &i) {
+            destroy();
+            allocator_ = i.allocator_;
+            allocation_ = i.allocation_;
+            alloc_info_ = i.alloc_info_;
+            image_ = i.image_;
 
-        i.allocator_ = VMA_NULL;
-        i.allocation_ = VMA_NULL;
-        i.image_ = VK_NULL_HANDLE;
+            i.allocator_ = VMA_NULL;
+            i.allocation_ = VMA_NULL;
+            i.image_ = VK_NULL_HANDLE;
+        }
 
         return *this;
+    }
+
+    std::optional<View> create_view(
+        vkb::DispatchTable &dispatch, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect_flags) {
+        VkImageViewCreateInfo view_desc = {};
+        view_desc.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_desc.viewType = type;
+        view_desc.image = image_;
+        view_desc.format = format;
+        view_desc.subresourceRange.baseMipLevel = 0;
+        view_desc.subresourceRange.levelCount = 1;
+        view_desc.subresourceRange.baseArrayLayer = 0;
+        view_desc.subresourceRange.layerCount = 1;
+        view_desc.subresourceRange.aspectMask = aspect_flags;
+
+        VkImageView image_view = VK_NULL_HANDLE;
+        VkResult res = dispatch.createImageView(&view_desc, nullptr, &image_view);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to create image view: %s", string_VkResult(res));
+            return {};
+        }
+
+        return View{dispatch, image_view};
     }
 
     void destroy() {
@@ -375,7 +446,7 @@ public:
         state->allocator_fns_.vkGetInstanceProcAddr = state->instance_.fp_vkGetInstanceProcAddr;
         state->allocator_fns_.vkGetDeviceProcAddr = state->instance_.fp_vkGetDeviceProcAddr;
 
-        VmaAllocatorCreateInfo alloc_create_info{};
+        VmaAllocatorCreateInfo alloc_create_info = {};
         alloc_create_info.flags = 0;
         alloc_create_info.vulkanApiVersion = VK_API_VERSION_1_0;
         alloc_create_info.physicalDevice = state->phys_dev_;
@@ -433,23 +504,154 @@ public:
     MemoryHelper(const MemoryHelper &) = delete;
     MemoryHelper &operator=(const MemoryHelper &) = delete;
 
+    std::optional<Image> create_image(
+        VkFormat format, VkImageUsageFlags usage, VkImageType type, const VkExtent3D &extent) {
+        VkResult res;
+        VkImageCreateInfo create_info = {};
+
+        create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        create_info.imageType = type;
+        create_info.format = format;
+        create_info.extent = extent;
+        create_info.mipLevels = 1;
+        create_info.arrayLayers = 1;
+        create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        create_info.usage = usage;
+
+        VmaAllocationCreateInfo alloc_desc = {};
+        alloc_desc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        alloc_desc.flags = 0;
+        alloc_desc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+        VkImage vk_image = VK_NULL_HANDLE;
+        VmaAllocation allocation = VMA_NULL;
+        VmaAllocationInfo alloc_info = {};
+
+        res = vmaCreateImage(state_.allocator(), &create_info, &alloc_desc, &vk_image, &allocation, &alloc_info);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("cannot create image: %s", string_VkResult(res));
+            return {};
+        }
+
+        return Image{state_.allocator(), vk_image, allocation, alloc_info};
+    }
+
+    std::optional<Image> create_image_rgba(
+        VkImageUsageFlags usage, uint32_t width, uint32_t height, void *pixels) const {
+        VkResult res;
+        VkDeviceSize image_size = width * height * 4;
+
+        // map the staging buffer and upload the raw pixels
+        void *mapped_mem;
+        res = vmaMapMemory(state_.allocator(), staging_buffer_.allocation(), &mapped_mem);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("cannot map staging buffer: %s", string_VkResult(res));
+            return {};
+        }
+
+        memcpy(mapped_mem, pixels, image_size);
+        vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
+
+        VkImageCreateInfo create_info = {};
+        create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        create_info.imageType = VK_IMAGE_TYPE_2D;
+        create_info.format = VK_FORMAT_R8G8B8A8_SRGB;
+        create_info.extent = VkExtent3D{width, height, 1};
+        create_info.mipLevels = 1;
+        create_info.arrayLayers = 1;
+        create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        create_info.usage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+        VmaAllocationCreateInfo alloc_desc = {};
+        alloc_desc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        alloc_desc.flags = 0;
+        alloc_desc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+        VkImage vk_image = VK_NULL_HANDLE;
+        VmaAllocation allocation = VMA_NULL;
+        VmaAllocationInfo alloc_info = {};
+
+        res = vmaCreateImage(state_.allocator(), &create_info, &alloc_desc, &vk_image, &allocation, &alloc_info);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("cannot create image: %s", string_VkResult(res));
+            return {};
+        }
+
+        Image image{state_.allocator(), vk_image, allocation, alloc_info};
+
+        if (!run_on_transfer_queue([&](VkCommandBuffer command_buffer) {
+            VkImageSubresourceRange range;
+            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            range.baseMipLevel = 0;
+            range.baseArrayLayer = 0;
+            range.levelCount = 1;
+            range.layerCount = 1;
+
+            // move the image to layout optimal for transfer
+            VkImageMemoryBarrier transfer_barrier = {};
+            transfer_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            transfer_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            transfer_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            transfer_barrier.image = image.image();
+            transfer_barrier.subresourceRange = range;
+            transfer_barrier.srcAccessMask = 0;
+            transfer_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            state_.dispatch().cmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &transfer_barrier);
+
+            // execute transfer from staging buffer to image
+            VkBufferImageCopy image_copy = {};
+            image_copy.bufferOffset = 0;
+            image_copy.bufferRowLength = 0;
+            image_copy.bufferImageHeight = 0;
+            image_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            image_copy.imageSubresource.mipLevel = 0;
+            image_copy.imageSubresource.baseArrayLayer = 0;
+            image_copy.imageSubresource.layerCount = 1;
+            image_copy.imageExtent = VkExtent3D{width, height, 1};
+
+            state_.dispatch().cmdCopyBufferToImage(command_buffer, staging_buffer_.buffer(), image.image(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
+
+            // move the image to layout optimal for gpu rendering
+            VkImageMemoryBarrier optimal_barrier = {};
+            optimal_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            optimal_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            optimal_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            optimal_barrier.image = image.image();
+            optimal_barrier.subresourceRange = range;
+
+            // has to complete before its used in fragment shader
+            state_.dispatch().cmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &optimal_barrier);
+        })) {
+            LOG_ERROR("failed to upload image data to the gpu");
+            return {};
+        }
+
+        return image;
+    }
+
     std::optional<Buffer> create_shared_buffer(const VkBufferUsageFlags usage, size_t byte_size) const {
         VkResult res;
 
-        VkBufferCreateInfo create_info{};
+        VkBufferCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         create_info.size = byte_size;
         create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         create_info.usage = usage;
 
-        VmaAllocationCreateInfo alloc_create_info{};
+        VmaAllocationCreateInfo alloc_create_info = {};
         alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO;
         alloc_create_info.flags =
             VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
         VkBuffer vk_buffer = VK_NULL_HANDLE;
         VmaAllocation allocation = VMA_NULL;
-        VmaAllocationInfo alloc_info{};
+        VmaAllocationInfo alloc_info = {};
 
         res =
             vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
@@ -470,7 +672,7 @@ public:
             return {};
         }
 
-        VkBufferCreateInfo create_info{};
+        VkBufferCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         create_info.size = byte_size;
         create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -482,7 +684,7 @@ public:
         }
 
         // vma allocation info
-        VmaAllocationCreateInfo alloc_create_info{};
+        VmaAllocationCreateInfo alloc_create_info = {};
         alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
         if (use_staging) {
@@ -497,7 +699,7 @@ public:
 
         VkBuffer vk_buffer = VK_NULL_HANDLE;
         VmaAllocation allocation = VMA_NULL;
-        VmaAllocationInfo alloc_info{};
+        VmaAllocationInfo alloc_info = {};
 
         res =
             vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
@@ -554,10 +756,10 @@ public:
         return std::move(buffer);
     }
 
-    bool copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) const {
+    template <typename F> bool run_on_transfer_queue(F runner) const {
         VkResult res;
 
-        VkCommandBufferBeginInfo begin_info{};
+        VkCommandBufferBeginInfo begin_info = {};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.pInheritanceInfo = 0;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -568,19 +770,15 @@ public:
             return false;
         }
 
-        VkBufferCopy copy_info{};
-        copy_info.srcOffset = 0;
-        copy_info.dstOffset = 0;
-        copy_info.size = size;
+        runner(command_buffer_);
 
-        state_.dispatch().cmdCopyBuffer(command_buffer_, src, dst, 1, &copy_info);
         res = state_.dispatch().endCommandBuffer(command_buffer_);
         if (VK_SUCCESS != res) {
             LOG_ERROR("end upload command buffer failure: %s", string_VkResult(res));
             return false;
         }
 
-        VkSubmitInfo submit_info{};
+        VkSubmitInfo submit_info = {};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.pCommandBuffers = &command_buffer_;
         submit_info.commandBufferCount = 1;
@@ -612,23 +810,34 @@ public:
         return true;
     }
 
+    bool copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) const {
+        return run_on_transfer_queue([&](VkCommandBuffer command_buffer) {
+            VkBufferCopy copy_info = {};
+            copy_info.srcOffset = 0;
+            copy_info.dstOffset = 0;
+            copy_info.size = size;
+
+            state_.dispatch().cmdCopyBuffer(command_buffer, src, dst, 1, &copy_info);
+        });
+    }
+
     static std::unique_ptr<MemoryHelper> initialize(ProgramState &state) {
         std::unique_ptr<MemoryHelper> memory{new MemoryHelper(state)};
 
         // initialize staging buffer
-        VkBufferCreateInfo staging_buffer_desc{};
+        VkBufferCreateInfo staging_buffer_desc = {};
         staging_buffer_desc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         staging_buffer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         staging_buffer_desc.size = kStagingBufferSize;
         staging_buffer_desc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        VmaAllocationCreateInfo staging_alloc_desc{};
+        VmaAllocationCreateInfo staging_alloc_desc = {};
         staging_alloc_desc.usage = VMA_MEMORY_USAGE_AUTO;
         staging_alloc_desc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 
         VmaAllocation allocation = VMA_NULL;
         VkBuffer vk_buffer = VK_NULL_HANDLE;
-        VmaAllocationInfo alloc_info{};
+        VmaAllocationInfo alloc_info = {};
 
         VkResult res = vmaCreateBuffer(
             state.allocator(), &staging_buffer_desc, &staging_alloc_desc, &vk_buffer, &allocation, &alloc_info);
@@ -640,7 +849,7 @@ public:
         memory->staging_buffer_ = Buffer{state.allocator(), vk_buffer, allocation, alloc_info};
 
         // initialize fence for completion
-        VkFenceCreateInfo fence_desc{};
+        VkFenceCreateInfo fence_desc = {};
         fence_desc.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 
         res = state.dispatch().createFence(&fence_desc, nullptr, &memory->fence_complete_);
@@ -650,7 +859,7 @@ public:
         }
 
         // initialize command pool for the memory helper
-        VkCommandPoolCreateInfo pool_desc{};
+        VkCommandPoolCreateInfo pool_desc = {};
         pool_desc.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         pool_desc.flags = 0;
         pool_desc.queueFamilyIndex = state.device().get_queue_index(vkb::QueueType::graphics).value();
@@ -661,7 +870,7 @@ public:
         }
 
         // since we have the staging buffer, we would also like to get the upload command buffer
-        VkCommandBufferAllocateInfo cmd_alloc_info{};
+        VkCommandBufferAllocateInfo cmd_alloc_info = {};
         cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cmd_alloc_info.commandPool = memory->command_pool_;
         cmd_alloc_info.commandBufferCount = 1;
@@ -747,6 +956,9 @@ public:
     std::vector<VkFramebuffer> swapchain_fbs_;
     std::vector<FrameSubmitData> frame_data_;
 
+    Image depth_image_;
+    std::optional<Image::View> depth_view_;
+
     // currently rendered frame out of frames in flight
     uint32_t current_frame_;
 
@@ -759,6 +971,24 @@ private:
     SceneState &operator=(const SceneState &) = delete;
 
     bool create_framebuffers() {
+        // create the depth image
+        auto depth_image = memory_->create_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            VK_IMAGE_TYPE_2D, VkExtent3D{state_.swapchain().extent.width, state_.swapchain().extent.height, 1});
+
+        if (!depth_image) {
+            LOG_ERROR("failed to initialize depth image");
+            return false;
+        }
+
+        depth_image_ = std::move(depth_image.value());
+        depth_view_ = depth_image_.create_view(
+            state_.dispatch(), VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        if (!depth_view_) {
+            LOG_ERROR("failed to create depth view");
+            return false;
+        }
+
         swapchain_images_ = state_.swapchain().get_images().value();
         swapchain_views_ = state_.swapchain().get_image_views().value();
 
@@ -766,13 +996,13 @@ private:
 
         swapchain_fbs_.resize(swapchain_views_.size());
         for (size_t i = 0; i < swapchain_views_.size(); ++i) {
-            VkImageView attachments[] = {swapchain_views_[i]};
+            std::array<VkImageView, 2> attachments = {swapchain_views_[i], depth_view_->view()};
 
             VkFramebufferCreateInfo framebuffer_info = {};
             framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             framebuffer_info.renderPass = render_pass_;
-            framebuffer_info.attachmentCount = 1;
-            framebuffer_info.pAttachments = attachments;
+            framebuffer_info.attachmentCount = static_cast<uint32_t>(attachments.size());
+            framebuffer_info.pAttachments = attachments.data();
             framebuffer_info.width = state_.swapchain().extent.width;
             framebuffer_info.height = state_.swapchain().extent.height;
             framebuffer_info.layers = 1;
@@ -885,7 +1115,7 @@ public:
         }
 
         // begin recording command buffer
-        VkCommandBufferBeginInfo cmd_begin_desc{};
+        VkCommandBufferBeginInfo cmd_begin_desc = {};
         cmd_begin_desc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         cmd_begin_desc.flags = 0;
         cmd_begin_desc.pInheritanceInfo = nullptr;
@@ -896,19 +1126,17 @@ public:
             return false;
         }
 
-        VkClearValue clear_value;
-        clear_value.color.float32[0] = 0.0f;
-        clear_value.color.float32[1] = 0.0f;
-        clear_value.color.float32[2] = 0.0f;
-        clear_value.color.float32[3] = 1.0f;
+        std::array<VkClearValue, 2> clear_values;
+        clear_values[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        clear_values[1].depthStencil = {1.0f, 0};
 
-        VkRenderPassBeginInfo render_begin_desc{};
+        VkRenderPassBeginInfo render_begin_desc = {};
         render_begin_desc.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         render_begin_desc.renderPass = render_pass_;
         render_begin_desc.framebuffer = swapchain_fbs_[image_index];
         render_begin_desc.renderArea = VkRect2D{{0, 0}, state_.swapchain().extent};
-        render_begin_desc.pClearValues = &clear_value;
-        render_begin_desc.clearValueCount = 1;
+        render_begin_desc.pClearValues = clear_values.data();
+        render_begin_desc.clearValueCount = static_cast<uint32_t>(clear_values.size());
 
         state_.dispatch().cmdBeginRenderPass(frame.command_buffer_, &render_begin_desc, VK_SUBPASS_CONTENTS_INLINE);
         state_.dispatch().cmdBindPipeline(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_);
@@ -916,7 +1144,7 @@ public:
             pipeline_layout_, 0, 1, &frame.per_frame_set_, 0, nullptr);
 
         // dynamic state
-        VkViewport vp{};
+        VkViewport vp = {};
         vp.width = state_.swapchain().extent.width;
         vp.height = state_.swapchain().extent.height;
         vp.x = 0;
@@ -941,7 +1169,7 @@ public:
         // submitting the recorder buffer
         VkPipelineStageFlags wait_mask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
-        VkSubmitInfo submit_info{};
+        VkSubmitInfo submit_info = {};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.pWaitDstStageMask = &wait_mask;
         submit_info.pWaitSemaphores = &frame.sem_image_avaliable_;
@@ -953,7 +1181,7 @@ public:
 
         state_.dispatch().queueSubmit(state_.graphics_queue(), 1, &submit_info, frame.fence_in_flight_);
 
-        VkPresentInfoKHR present_info{};
+        VkPresentInfoKHR present_info = {};
         present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present_info.pWaitSemaphores = &frame.sem_render_done_;
         present_info.waitSemaphoreCount = 1;
@@ -989,7 +1217,7 @@ public:
     static VkShaderModule shader_from_bytecode(ProgramState &state, const void *buffer, size_t size) {
         VkResult res;
 
-        VkShaderModuleCreateInfo create_info{};
+        VkShaderModuleCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         create_info.codeSize = size;
         create_info.pCode = reinterpret_cast<const uint32_t *>(buffer);
@@ -1015,29 +1243,49 @@ public:
         color_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         color_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
+        VkAttachmentDescription depth_attachment = {};
+        depth_attachment.format = VK_FORMAT_D32_SFLOAT;
+        depth_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depth_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depth_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depth_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depth_attachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
         VkAttachmentReference color_attachment_ref = {};
         color_attachment_ref.attachment = 0;
         color_attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference depth_attachment_ref = {};
+        depth_attachment_ref.attachment = 1;
+        depth_attachment_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
         VkSubpassDescription subpass = {};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &color_attachment_ref;
+        subpass.pDepthStencilAttachment = &depth_attachment_ref;
 
         // ensure rendering does not start until image is available
         // this is actually not needed because drivers are required to automatically insert this
         VkSubpassDependency dependency = {};
         dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
         dependency.dstSubpass = 0;
-        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcStageMask =
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         dependency.srcAccessMask = 0;
-        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependency.dstStageMask =
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+        std::array<VkAttachmentDescription, 2> attachments{color_attachment, depth_attachment};
 
         VkRenderPassCreateInfo render_pass_info = {};
         render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        render_pass_info.attachmentCount = 1;
-        render_pass_info.pAttachments = &color_attachment;
+        render_pass_info.attachmentCount = static_cast<uint32_t>(attachments.size());
+        render_pass_info.pAttachments = attachments.data();
         render_pass_info.subpassCount = 1;
         render_pass_info.pSubpasses = &subpass;
         render_pass_info.dependencyCount = 1;
@@ -1054,13 +1302,13 @@ public:
     }
 
     static bool create_descriptor_data(ProgramState &state, SceneState &scene) {
-        VkDescriptorSetLayoutBinding per_frame_binding{};
+        VkDescriptorSetLayoutBinding per_frame_binding = {};
         per_frame_binding.binding = 0;
         per_frame_binding.descriptorCount = 1;
         per_frame_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         per_frame_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
-        VkDescriptorSetLayoutCreateInfo set_info{};
+        VkDescriptorSetLayoutCreateInfo set_info = {};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         set_info.bindingCount = 1;
         set_info.flags = 0;
@@ -1075,7 +1323,7 @@ public:
         // allocate descriptor pool
         std::array<VkDescriptorPoolSize, 1> pool_sizes = {VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 100}};
 
-        VkDescriptorPoolCreateInfo pool_desc{};
+        VkDescriptorPoolCreateInfo pool_desc = {};
         pool_desc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_desc.flags = 0;
         pool_desc.maxSets = 100;
@@ -1142,7 +1390,7 @@ public:
         std::array<VkPipelineShaderStageCreateInfo, 2> shader_stages = {vert_stage_info, frag_stage_info};
 
         // set viewport and scissor as dynamic state
-        VkPipelineDynamicStateCreateInfo dynamic_state_desc{};
+        VkPipelineDynamicStateCreateInfo dynamic_state_desc = {};
         dynamic_state_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
         dynamic_state_desc.pDynamicStates = kDynamicStates.data();
         dynamic_state_desc.dynamicStateCount = static_cast<uint32_t>(kDynamicStates.size());
@@ -1154,12 +1402,12 @@ public:
             VkVertexInputAttributeDescription{2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
         };
 
-        VkVertexInputBindingDescription vertex_binding_desc{};
+        VkVertexInputBindingDescription vertex_binding_desc = {};
         vertex_binding_desc.binding = 0;
         vertex_binding_desc.stride = sizeof(Vertex);
         vertex_binding_desc.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-        VkPipelineVertexInputStateCreateInfo input_state_desc{};
+        VkPipelineVertexInputStateCreateInfo input_state_desc = {};
         input_state_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         input_state_desc.pVertexAttributeDescriptions = kVertexAttribDesc.data();
         input_state_desc.vertexAttributeDescriptionCount = static_cast<uint32_t>(kVertexAttribDesc.size());
@@ -1167,19 +1415,19 @@ public:
         input_state_desc.vertexBindingDescriptionCount = 1;
 
         // input assembly
-        VkPipelineInputAssemblyStateCreateInfo assembly_desc{};
+        VkPipelineInputAssemblyStateCreateInfo assembly_desc = {};
         assembly_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
         assembly_desc.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         assembly_desc.primitiveRestartEnable = false;
 
         // dynamic state
-        VkPipelineViewportStateCreateInfo viewport_desc{};
+        VkPipelineViewportStateCreateInfo viewport_desc = {};
         viewport_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
         viewport_desc.viewportCount = 1;
         viewport_desc.scissorCount = 1;
 
         // rasterization
-        VkPipelineRasterizationStateCreateInfo rasterizer_desc{};
+        VkPipelineRasterizationStateCreateInfo rasterizer_desc = {};
         rasterizer_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         rasterizer_desc.depthClampEnable = false;
         rasterizer_desc.rasterizerDiscardEnable = false;
@@ -1193,7 +1441,7 @@ public:
         rasterizer_desc.depthBiasSlopeFactor = 0.0f;
 
         // no multisampling
-        VkPipelineMultisampleStateCreateInfo multisample_desc{};
+        VkPipelineMultisampleStateCreateInfo multisample_desc = {};
         multisample_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         multisample_desc.sampleShadingEnable = false;
         multisample_desc.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -1203,12 +1451,12 @@ public:
         multisample_desc.alphaToOneEnable = false;
 
         // no blending
-        VkPipelineColorBlendAttachmentState blend_att_desc{};
+        VkPipelineColorBlendAttachmentState blend_att_desc = {};
         blend_att_desc.colorWriteMask =
             VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
         blend_att_desc.blendEnable = false;
 
-        VkPipelineColorBlendStateCreateInfo blend_desc{};
+        VkPipelineColorBlendStateCreateInfo blend_desc = {};
         blend_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         blend_desc.logicOpEnable = false;
         blend_desc.logicOp = VK_LOGIC_OP_COPY;
@@ -1219,8 +1467,16 @@ public:
         blend_desc.pAttachments = &blend_att_desc;
         blend_desc.attachmentCount = 1;
 
+        VkPipelineDepthStencilStateCreateInfo depth_desc = {};
+        depth_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depth_desc.depthWriteEnable = VK_TRUE;
+        depth_desc.depthTestEnable = VK_TRUE;
+        depth_desc.depthCompareOp = VK_COMPARE_OP_LESS;
+        depth_desc.depthBoundsTestEnable = VK_FALSE;
+        depth_desc.stencilTestEnable = VK_FALSE;
+
         // finally, create the graphics pipeline
-        VkGraphicsPipelineCreateInfo create_info{};
+        VkGraphicsPipelineCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         create_info.pStages = shader_stages.data();
         create_info.stageCount = static_cast<uint32_t>(shader_stages.size());
@@ -1231,6 +1487,7 @@ public:
         create_info.pMultisampleState = &multisample_desc;
         create_info.pColorBlendState = &blend_desc;
         create_info.pDynamicState = &dynamic_state_desc;
+        create_info.pDepthStencilState = &depth_desc;
         create_info.layout = layout;
         create_info.renderPass = render_pass;
         create_info.subpass = subpass_index;
@@ -1251,7 +1508,7 @@ public:
     }
 
     static bool create_command_pool(ProgramState &state, uint32_t family_index, VkCommandPool *command_pool) {
-        VkCommandPoolCreateInfo create_info{};
+        VkCommandPoolCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         create_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         create_info.queueFamilyIndex = family_index;
@@ -1274,7 +1531,7 @@ public:
         command_buffers.resize(frames_in_flight);
         std::fill(command_buffers.begin(), command_buffers.end(), VK_NULL_HANDLE);
 
-        VkCommandBufferAllocateInfo buffer_info{};
+        VkCommandBufferAllocateInfo buffer_info = {};
         buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         buffer_info.commandPool = scene.command_pool_;
         buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1290,10 +1547,10 @@ public:
             scene.frame_data_.push_back(FrameSubmitData(state, scene));
             auto &frame = scene.frame_data_.back();
 
-            VkSemaphoreCreateInfo sem_create_info{};
+            VkSemaphoreCreateInfo sem_create_info = {};
             sem_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
-            VkFenceCreateInfo fence_create_info{};
+            VkFenceCreateInfo fence_create_info = {};
             fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             fence_create_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
@@ -1327,7 +1584,7 @@ public:
             frame.per_frame_buffer_ = std::move(buffer.value());
 
             // allocate descriptor set
-            VkDescriptorSetAllocateInfo set_alloc_info{};
+            VkDescriptorSetAllocateInfo set_alloc_info = {};
             set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
             set_alloc_info.descriptorPool = scene.descriptor_pool_;
             set_alloc_info.descriptorSetCount = 1;
@@ -1340,12 +1597,12 @@ public:
             }
 
             // point the descriptor set to the buffer
-            VkDescriptorBufferInfo buffer_info{};
+            VkDescriptorBufferInfo buffer_info = {};
             buffer_info.buffer = frame.per_frame_buffer_.buffer();
             buffer_info.offset = 0;
             buffer_info.range = sizeof(cbPerFrame);
 
-            VkWriteDescriptorSet write_set{};
+            VkWriteDescriptorSet write_set = {};
             write_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             write_set.dstBinding = 0;
             write_set.dstSet = frame.per_frame_set_;
