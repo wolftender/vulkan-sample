@@ -39,8 +39,8 @@
 #include "resources/vertex.h"
 #include "resources/fragment.h"
 
-#define LOG_ERROR(fmt, ...) fprintf(stderr, "[error] " fmt "\n", ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...) fprintf(stderr, "[info] " fmt "\n", ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) fprintf(stderr, "[error] at %s line %d " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...) fprintf(stderr, "[info] at %s line %d " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 
 struct Buffer final {
 private:
@@ -413,6 +413,270 @@ struct cbPerFrame {
     glm::fmat4 proj;
 };
 
+struct MemoryHelper final {
+private:
+    ProgramState &state_;
+
+    Buffer staging_buffer_;
+    VkFence fence_complete_;
+    VkCommandPool command_pool_;
+    VkCommandBuffer command_buffer_;
+
+    MemoryHelper(ProgramState &state) : state_{state} {}
+
+public:
+    ~MemoryHelper() {
+        state_.dispatch().destroyFence(fence_complete_, nullptr);
+        state_.dispatch().destroyCommandPool(command_pool_, nullptr);
+    }
+
+    MemoryHelper(const MemoryHelper &) = delete;
+    MemoryHelper &operator=(const MemoryHelper &) = delete;
+
+    std::optional<Buffer> create_shared_buffer(const VkBufferUsageFlags usage, size_t byte_size) const {
+        VkResult res;
+
+        VkBufferCreateInfo create_info{};
+        create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        create_info.size = byte_size;
+        create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        create_info.usage = usage;
+
+        VmaAllocationCreateInfo alloc_create_info{};
+        alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO;
+        alloc_create_info.flags =
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+        VkBuffer vk_buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = VMA_NULL;
+        VmaAllocationInfo alloc_info{};
+
+        res =
+            vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("cannot create buffer: %s", string_VkResult(res));
+            return {};
+        }
+
+        return Buffer{state_.allocator(), vk_buffer, allocation, alloc_info};
+    }
+
+    std::optional<Buffer> create_buffer(
+        const VkBufferUsageFlags usage, const void *data, size_t byte_size, bool use_staging) const {
+        VkResult res;
+
+        if (use_staging && kStagingBufferSize < byte_size) {
+            LOG_ERROR("requested device-only memory but staging buffer too small for the resource");
+            return {};
+        }
+
+        VkBufferCreateInfo create_info{};
+        create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        create_info.size = byte_size;
+        create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (use_staging) {
+            create_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        } else {
+            create_info.usage = usage;
+        }
+
+        // vma allocation info
+        VmaAllocationCreateInfo alloc_create_info{};
+        alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+        if (use_staging) {
+            // if we use staging buffer then we can have no sequential write since we will do copy using staging
+            // this allows for usage of gram etc.
+            alloc_create_info.flags = 0;
+            alloc_create_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        } else {
+            // if we don't use the staging buffer, then we need to have sequential access
+            alloc_create_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+        }
+
+        VkBuffer vk_buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = VMA_NULL;
+        VmaAllocationInfo alloc_info{};
+
+        res =
+            vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("cannot create buffer: %s", string_VkResult(res));
+            return {};
+        }
+
+        Buffer buffer{state_.allocator(), vk_buffer, allocation, alloc_info};
+
+        // check if can be mapped on host, not always use_staging = cannot be mapped
+        auto mem_prop_flags = buffer.mem_prop_flags();
+
+        // data upload
+        if (mem_prop_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            // memory is host visible, we can memcpy into it
+
+            void *mapped_mem;
+            res = vmaMapMemory(state_.allocator(), buffer.allocation(), &mapped_mem);
+            if (VK_SUCCESS != res) {
+                LOG_ERROR("cannot map buffer: %s", string_VkResult(res));
+                return {};
+            }
+
+            memcpy(mapped_mem, data, byte_size);
+            vmaUnmapMemory(state_.allocator(), buffer.allocation());
+
+            res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
+            if (VK_SUCCESS != res) {
+                LOG_ERROR("vmaFlushAllocation failure: %s", string_VkResult(res));
+                return {};
+            }
+        } else {
+            void *mapped_mem;
+            res = vmaMapMemory(state_.allocator(), staging_buffer_.allocation(), &mapped_mem);
+            if (VK_SUCCESS != res) {
+                LOG_ERROR("cannot map staging buffer: %s", string_VkResult(res));
+                return {};
+            }
+
+            memcpy(mapped_mem, data, byte_size);
+            vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
+
+            // transfer command
+            res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
+            if (VK_SUCCESS != res) {
+                LOG_ERROR("vmaFlushAllocation failure: %s", string_VkResult(res));
+                return {};
+            }
+
+            copy_buffer(staging_buffer_.buffer(), buffer.buffer(), byte_size);
+        }
+
+        return std::move(buffer);
+    }
+
+    bool copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) const {
+        VkResult res;
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.pInheritanceInfo = 0;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        res = state_.dispatch().beginCommandBuffer(command_buffer_, &begin_info);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("begin upload command buffer failure: %s", string_VkResult(res));
+            return false;
+        }
+
+        VkBufferCopy copy_info{};
+        copy_info.srcOffset = 0;
+        copy_info.dstOffset = 0;
+        copy_info.size = size;
+
+        state_.dispatch().cmdCopyBuffer(command_buffer_, src, dst, 1, &copy_info);
+        res = state_.dispatch().endCommandBuffer(command_buffer_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("end upload command buffer failure: %s", string_VkResult(res));
+            return false;
+        }
+
+        VkSubmitInfo submit_info{};
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit_info.pCommandBuffers = &command_buffer_;
+        submit_info.commandBufferCount = 1;
+
+        res = state_.dispatch().queueSubmit(state_.graphics_queue(), 1, &submit_info, fence_complete_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("submit upload command buffer failure: %s", string_VkResult(res));
+            return false;
+        }
+
+        res = state_.dispatch().waitForFences(1, &fence_complete_, true, UINT64_MAX);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("wait complete fence failed: %s", string_VkResult(res));
+            return false;
+        }
+
+        res = state_.dispatch().resetFences(1, &fence_complete_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("reset complete fence failed: %s", string_VkResult(res));
+            return false;
+        }
+
+        res = state_.dispatch().resetCommandPool(command_pool_, 0);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("reset upload command pool failed: %s", string_VkResult(res));
+            return false;
+        }
+
+        return true;
+    }
+
+    static std::unique_ptr<MemoryHelper> initialize(ProgramState &state) {
+        std::unique_ptr<MemoryHelper> memory{new MemoryHelper(state)};
+
+        // initialize staging buffer
+        VkBufferCreateInfo staging_buffer_desc{};
+        staging_buffer_desc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        staging_buffer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        staging_buffer_desc.size = kStagingBufferSize;
+        staging_buffer_desc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo staging_alloc_desc{};
+        staging_alloc_desc.usage = VMA_MEMORY_USAGE_AUTO;
+        staging_alloc_desc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+
+        VmaAllocation allocation = VMA_NULL;
+        VkBuffer vk_buffer = VK_NULL_HANDLE;
+        VmaAllocationInfo alloc_info{};
+
+        VkResult res = vmaCreateBuffer(
+            state.allocator(), &staging_buffer_desc, &staging_alloc_desc, &vk_buffer, &allocation, &alloc_info);
+        if (res != VK_SUCCESS) {
+            LOG_ERROR("failed to allocate staging buffer: %s", string_VkResult(res));
+            return {};
+        }
+
+        memory->staging_buffer_ = Buffer{state.allocator(), vk_buffer, allocation, alloc_info};
+
+        // initialize fence for completion
+        VkFenceCreateInfo fence_desc{};
+        fence_desc.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+
+        res = state.dispatch().createFence(&fence_desc, nullptr, &memory->fence_complete_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to create fence: %s", string_VkResult(res));
+            return {};
+        }
+
+        // initialize command pool for the memory helper
+        VkCommandPoolCreateInfo pool_desc{};
+        pool_desc.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_desc.flags = 0;
+        pool_desc.queueFamilyIndex = state.device().get_queue_index(vkb::QueueType::graphics).value();
+        res = state.dispatch().createCommandPool(&pool_desc, nullptr, &memory->command_pool_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to create upload command pool: %s", string_VkResult(res));
+            return {};
+        }
+
+        // since we have the staging buffer, we would also like to get the upload command buffer
+        VkCommandBufferAllocateInfo cmd_alloc_info{};
+        cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc_info.commandPool = memory->command_pool_;
+        cmd_alloc_info.commandBufferCount = 1;
+        cmd_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+
+        res = state.dispatch().allocateCommandBuffers(&cmd_alloc_info, &memory->command_buffer_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to create upload command buffer: %s", string_VkResult(res));
+            return {};
+        }
+
+        return memory;
+    }
+};
+
 struct SceneState final {
 public:
     struct FrameSubmitData final {
@@ -467,6 +731,8 @@ public:
     };
 
     ProgramState &state_;
+    std::unique_ptr<MemoryHelper> memory_;
+
     VkRenderPass render_pass_;
     VkPipelineLayout pipeline_layout_;
     VkPipeline graphics_pipeline_;
@@ -475,10 +741,6 @@ public:
     // descriptor set layouts
     VkDescriptorPool descriptor_pool_;
     VkDescriptorSetLayout layout_per_frame_;
-
-    // resource uploading
-    Buffer staging_buffer_;
-    VkCommandBuffer upload_buffer_;
 
     std::vector<VkImage> swapchain_images_;
     std::vector<VkImageView> swapchain_views_;
@@ -535,6 +797,8 @@ public:
 
         LOG_INFO("destroying the scene state");
 
+        memory_.reset(); // manually release to prevent validation errors
+
         for (auto &fb : swapchain_fbs_) {
             state_.dispatch().destroyFramebuffer(fb, nullptr);
         }
@@ -548,6 +812,8 @@ public:
         state_.dispatch().destroyPipelineLayout(pipeline_layout_, nullptr);
         state_.dispatch().destroyPipeline(graphics_pipeline_, nullptr);
     }
+
+    MemoryHelper &memory() { return *memory_; }
 
     bool rebuild_swapchain() {
         LOG_INFO("rebuilding swapchain");
@@ -717,178 +983,6 @@ public:
         }
 
         current_frame_ = current_frame_ % static_cast<uint32_t>(frame_data_.size());
-        return true;
-    }
-
-    std::optional<Buffer> create_shared_buffer(const VkBufferUsageFlags usage, size_t byte_size) const {
-        VkResult res;
-
-        VkBufferCreateInfo create_info{};
-        create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        create_info.size = byte_size;
-        create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        create_info.usage = usage;
-
-        VmaAllocationCreateInfo alloc_create_info{};
-        alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO;
-        alloc_create_info.flags =
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-        VkBuffer vk_buffer = VK_NULL_HANDLE;
-        VmaAllocation allocation = VMA_NULL;
-        VmaAllocationInfo alloc_info{};
-
-        res =
-            vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("cannot create buffer: %s", string_VkResult(res));
-            return {};
-        }
-
-        return Buffer{state_.allocator(), vk_buffer, allocation, alloc_info};
-    }
-
-    std::optional<Buffer> create_buffer(
-        const VkBufferUsageFlags usage, const void *data, size_t byte_size, bool use_staging) const {
-        VkResult res;
-
-        if (use_staging && kStagingBufferSize < byte_size) {
-            LOG_ERROR("requested device-only memory but staging buffer too small for the resource");
-            return {};
-        }
-
-        VkBufferCreateInfo create_info{};
-        create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        create_info.size = byte_size;
-        create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        if (use_staging) {
-            create_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        } else {
-            create_info.usage = usage;
-        }
-
-        // vma allocation info
-        VmaAllocationCreateInfo alloc_create_info{};
-        alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-
-        if (use_staging) {
-            // if we use staging buffer then we can have no sequential write since we will do copy using staging
-            // this allows for usage of gram etc.
-            alloc_create_info.flags = 0;
-            alloc_create_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        } else {
-            // if we don't use the staging buffer, then we need to have sequential access
-            alloc_create_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-        }
-
-        VkBuffer vk_buffer = VK_NULL_HANDLE;
-        VmaAllocation allocation = VMA_NULL;
-        VmaAllocationInfo alloc_info{};
-
-        res =
-            vmaCreateBuffer(state_.allocator(), &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("cannot create buffer: %s", string_VkResult(res));
-            return {};
-        }
-
-        Buffer buffer{state_.allocator(), vk_buffer, allocation, alloc_info};
-
-        // check if can be mapped on host, not always use_staging = cannot be mapped
-        auto mem_prop_flags = buffer.mem_prop_flags();
-
-        // data upload
-        if (mem_prop_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-            // memory is host visible, we can memcpy into it
-
-            void *mapped_mem;
-            res = vmaMapMemory(state_.allocator(), buffer.allocation(), &mapped_mem);
-            if (VK_SUCCESS != res) {
-                LOG_ERROR("cannot map buffer: %s", string_VkResult(res));
-                return {};
-            }
-
-            memcpy(mapped_mem, data, byte_size);
-            vmaUnmapMemory(state_.allocator(), buffer.allocation());
-
-            res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
-            if (VK_SUCCESS != res) {
-                LOG_ERROR("vmaFlushAllocation failure: %s", string_VkResult(res));
-                return {};
-            }
-        } else {
-            void *mapped_mem;
-            res = vmaMapMemory(state_.allocator(), staging_buffer_.allocation(), &mapped_mem);
-            if (VK_SUCCESS != res) {
-                LOG_ERROR("cannot map staging buffer: %s", string_VkResult(res));
-                return {};
-            }
-
-            memcpy(mapped_mem, data, byte_size);
-            vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
-
-            // transfer command
-            res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
-            if (VK_SUCCESS != res) {
-                LOG_ERROR("vmaFlushAllocation failure: %s", string_VkResult(res));
-                return {};
-            }
-
-            copy_buffer(staging_buffer_.buffer(), buffer.buffer(), byte_size);
-        }
-
-        return std::move(buffer);
-    }
-
-    bool copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) const {
-        VkResult res;
-        res = state_.dispatch().resetCommandBuffer(upload_buffer_, 0);
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("reset upload command buffer failure: %s", string_VkResult(res));
-            return false;
-        }
-
-        VkCommandBufferBeginInfo begin_info{};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin_info.pInheritanceInfo = 0;
-        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        res = state_.dispatch().beginCommandBuffer(upload_buffer_, &begin_info);
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("begin upload command buffer failure: %s", string_VkResult(res));
-            return false;
-        }
-
-        VkBufferCopy copy_info{};
-        copy_info.srcOffset = 0;
-        copy_info.dstOffset = 0;
-        copy_info.size = size;
-
-        state_.dispatch().cmdCopyBuffer(upload_buffer_, src, dst, 1, &copy_info);
-        res = state_.dispatch().endCommandBuffer(upload_buffer_);
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("end upload command buffer failure: %s", string_VkResult(res));
-            return false;
-        }
-
-        VkSubmitInfo submit_info{};
-        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit_info.pCommandBuffers = &upload_buffer_;
-        submit_info.commandBufferCount = 1;
-
-        res = state_.dispatch().queueSubmit(state_.graphics_queue(), 1, &submit_info, VK_NULL_HANDLE);
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("submit upload command buffer failure: %s", string_VkResult(res));
-            return false;
-        }
-
-        res = state_.dispatch().deviceWaitIdle();
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("wait device idle failure: %s", string_VkResult(res));
-            return false;
-        }
-
         return true;
     }
 
@@ -1156,47 +1250,6 @@ public:
         return true;
     }
 
-    static bool create_staging_buffer(ProgramState &state, SceneState &scene) {
-        // initialize staging buffer
-        VkBufferCreateInfo staging_buffer_desc{};
-        staging_buffer_desc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        staging_buffer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        staging_buffer_desc.size = kStagingBufferSize;
-        staging_buffer_desc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        VmaAllocationCreateInfo staging_alloc_desc{};
-        staging_alloc_desc.usage = VMA_MEMORY_USAGE_AUTO;
-        staging_alloc_desc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-
-        VmaAllocation allocation = VMA_NULL;
-        VkBuffer vk_buffer = VK_NULL_HANDLE;
-        VmaAllocationInfo alloc_info{};
-
-        VkResult res = vmaCreateBuffer(
-            state.allocator(), &staging_buffer_desc, &staging_alloc_desc, &vk_buffer, &allocation, &alloc_info);
-        if (res != VK_SUCCESS) {
-            LOG_ERROR("failed to allocate staging buffer: %s", string_VkResult(res));
-            return false;
-        }
-
-        scene.staging_buffer_ = Buffer{state.allocator(), vk_buffer, allocation, alloc_info};
-
-        // since we have the staging buffer, we would also like to get the upload command buffer
-        VkCommandBufferAllocateInfo cmd_alloc_info{};
-        cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc_info.commandPool = scene.command_pool_;
-        cmd_alloc_info.commandBufferCount = 1;
-        cmd_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-
-        res = state.dispatch().allocateCommandBuffers(&cmd_alloc_info, &scene.upload_buffer_);
-        if (VK_SUCCESS != res) {
-            LOG_ERROR("failed to create upload command buffer: %s", string_VkResult(res));
-            return false;
-        }
-
-        return true;
-    }
-
     static bool create_command_pool(ProgramState &state, uint32_t family_index, VkCommandPool *command_pool) {
         VkCommandPoolCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1265,7 +1318,7 @@ public:
             }
 
             // allocate per frame ubo data
-            auto buffer = scene.create_shared_buffer(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, sizeof(cbPerFrame));
+            auto buffer = scene.memory_->create_shared_buffer(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, sizeof(cbPerFrame));
             if (!buffer) {
                 LOG_ERROR("failed allocating shared buffer");
                 return false;
@@ -1308,6 +1361,15 @@ public:
 
     static std::unique_ptr<SceneState> initialize(ProgramState &state) {
         std::unique_ptr<SceneState> scene{new SceneState(state)};
+
+        auto memory = MemoryHelper::initialize(state);
+        if (!memory) {
+            LOG_ERROR("failed to initialize memory helper");
+            return {};
+        }
+
+        scene->memory_ = std::move(memory);
+        LOG_INFO("initialized memory helper");
 
         if (!create_render_pass(state, &scene->render_pass_)) {
             LOG_ERROR("failed to create render pass");
@@ -1357,13 +1419,6 @@ public:
         }
 
         LOG_INFO("created frame submission data");
-
-        if (!create_staging_buffer(state, *scene)) {
-            LOG_ERROR("failed to create staging buffer");
-            return {};
-        }
-
-        LOG_INFO("created staging buffer");
 
         return scene;
     }
@@ -1483,7 +1538,7 @@ return Geometry{
 
         // create geometry and upload to a gram buffer
         auto geometry = cube_geometry();
-        auto vertex_buffer = scene.create_buffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, geometry.vertices.data(),
+        auto vertex_buffer = scene.memory().create_buffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, geometry.vertices.data(),
             sizeof(Vertex) * std::size(geometry.vertices), /* use staging buffer */ true);
 
         if (!vertex_buffer) {
@@ -1499,7 +1554,7 @@ return Geometry{
 
         LOG_INFO("vertex buffer upload complete");
 
-        auto index_buffer = scene.create_buffer(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, geometry.indices.data(),
+        auto index_buffer = scene.memory().create_buffer(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, geometry.indices.data(),
             sizeof(uint16_t) * std::size(geometry.indices), /* use staging buffer */ true);
 
         if (!index_buffer) {
