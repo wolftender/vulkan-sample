@@ -92,6 +92,16 @@ public:
         return *this;
     }
 
+    bool flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const {
+        VkResult res = vmaFlushAllocation(allocator_, allocation_, offset, size);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("VMA flush allocation failed: %s", string_VkResult(res));
+            return false;
+        }
+
+        return true;
+    }
+
     void destroy() {
         if (allocator_ != VMA_NULL && buffer_ != VK_NULL_HANDLE) {
             vmaDestroyBuffer(allocator_, buffer_, allocation_);
@@ -241,6 +251,16 @@ public:
         image_ = VK_NULL_HANDLE;
     }
 
+    bool flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const {
+        VkResult res = vmaFlushAllocation(allocator_, allocation_, offset, size);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("VMA flush allocation failed: %s", string_VkResult(res));
+            return false;
+        }
+
+        return true;
+    }
+
     VkMemoryPropertyFlags mem_prop_flags() const {
         if (allocator_ == VMA_NULL && image_ == VK_NULL_HANDLE) {
             return 0;
@@ -264,6 +284,7 @@ private:
     vkb::Device device_;
     vkb::DispatchTable dispatch_;
     vkb::Swapchain swapchain_;
+    VkPhysicalDeviceProperties phys_dev_props_;
 
     // queues
     VkQueue graphics_queue_, present_queue_;
@@ -298,6 +319,8 @@ public:
     vkb::Device &device() { return device_; }
     vkb::DispatchTable &dispatch() { return dispatch_; }
     vkb::Swapchain &swapchain() { return swapchain_; }
+
+    VkDeviceSize ubo_alignment() const { return phys_dev_props_.limits.minUniformBufferOffsetAlignment; }
 
     ~ProgramState() {
         LOG_INFO("freeing program state");
@@ -415,6 +438,7 @@ public:
 
         state->device_ = device_ret.value();
         state->dispatch_ = state->device_.make_table();
+        state->phys_dev_props_ = state->phys_dev_.properties;
 
         LOG_INFO("created vk device successfully");
 
@@ -551,6 +575,11 @@ public:
         }
 
         memcpy(mapped_mem, pixels, image_size);
+        if (!staging_buffer_.flush()) {
+            LOG_ERROR("cannot flush staging buffer");
+            return {};
+        }
+
         vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
 
         VkImageCreateInfo create_info = {};
@@ -725,6 +754,11 @@ public:
             }
 
             memcpy(mapped_mem, data, byte_size);
+            if (!buffer.flush()) {
+                LOG_ERROR("cannot flush buffer write");
+                return {};
+            }
+
             vmaUnmapMemory(state_.allocator(), buffer.allocation());
 
             res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
@@ -741,6 +775,11 @@ public:
             }
 
             memcpy(mapped_mem, data, byte_size);
+            if (!staging_buffer_.flush()) {
+                LOG_ERROR("cannot flush staging buffer write");
+                return {};
+            }
+
             vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
 
             // transfer command
@@ -910,6 +949,10 @@ public:
 
         void update_per_frame(const cbPerFrame &data) {
             memcpy(per_frame_buffer_.alloc_info().pMappedData, &data, sizeof(cbPerFrame));
+
+            if (!per_frame_buffer_.flush()) {
+                LOG_ERROR("cannot flush per frame uniform buffer");
+            }
         }
 
         FrameSubmitData(const FrameSubmitData &) = delete;
