@@ -506,6 +506,12 @@ struct Geometry {
     std::vector<uint32_t> indices;
 };
 
+struct Bitmap {
+    uint32_t width;
+    uint32_t height;
+    std::vector<uint8_t> pixels;
+};
+
 struct cbPerFrame {
     glm::fmat4 view;
     glm::fmat4 proj;
@@ -569,7 +575,7 @@ public:
     }
 
     std::optional<Image> create_image_rgba(
-        VkImageUsageFlags usage, uint32_t width, uint32_t height, void *pixels) const {
+        VkImageUsageFlags usage, uint32_t width, uint32_t height, const void *pixels) const {
         VkResult res;
         VkDeviceSize image_size = width * height * 4;
 
@@ -1033,6 +1039,7 @@ struct SceneState final {
 public:
     static constexpr size_t kMaxStaticMeshes = 128;
     static constexpr size_t kMaxObjects = 1024;
+    static constexpr size_t kMaxMaterials = 256;
 
     template <typename T> struct Identifier {
     private:
@@ -1066,6 +1073,74 @@ public:
         bool valid() const { return id_ != kInvalidId; }
     };
 
+    struct Material final {
+    public:
+        using Id = Identifier<Material>;
+
+    private:
+        ProgramState *state_;
+        Id id_;
+        Image image_;
+        Image::View image_view_;
+        VkSampler sampler_;
+        VkDescriptorSet descriptor_set_;
+
+        Material(ProgramState &state, const Id &id, Image &&image, Image::View &&image_view, VkSampler sampler,
+            VkDescriptorSet descriptor_set)
+            : state_{&state}, id_{id}, image_{std::move(image)}, image_view_{std::move(image_view)}, sampler_{sampler},
+              descriptor_set_{descriptor_set} {}
+
+        friend struct SceneState;
+
+    public:
+        const Id &id() const { return id_; }
+        Image &image() { return image_; }
+        Image::View &image_view() { return image_view_; }
+        VkSampler sampler() { return sampler_; }
+        VkDescriptorSet descriptor_set() { return descriptor_set_; }
+
+        ~Material() {
+            if (state_ && sampler_ != VK_NULL_HANDLE) {
+                state_->dispatch().destroySampler(sampler_, nullptr);
+            }
+
+            state_ = nullptr;
+            sampler_ = VK_NULL_HANDLE;
+        }
+
+        Material(const Material &) = delete;
+        Material &operator=(const Material &) = delete;
+
+        Material(Material &&m) : image_view_{std::move(m.image_view_)} {
+            state_ = m.state_;
+            id_ = std::move(m.id_);
+            image_ = std::move(m.image_);
+            sampler_ = m.sampler_;
+            descriptor_set_ = m.descriptor_set_;
+
+            m.state_ = nullptr;
+            m.sampler_ = VK_NULL_HANDLE;
+            m.descriptor_set_ = VK_NULL_HANDLE;
+        }
+
+        Material &operator=(Material &&m) {
+            if (this != &m) {
+                state_ = m.state_;
+                id_ = std::move(m.id_);
+                image_ = std::move(m.image_);
+                descriptor_set_ = m.descriptor_set_;
+                descriptor_set_ = m.descriptor_set_;
+                image_view_ = std::move(m.image_view_);
+
+                m.state_ = nullptr;
+                m.sampler_ = VK_NULL_HANDLE;
+                m.descriptor_set_ = VK_NULL_HANDLE;
+            }
+
+            return *this;
+        }
+    };
+
     struct StaticMesh final {
     public:
         using Id = Identifier<StaticMesh>;
@@ -1085,7 +1160,7 @@ public:
         friend struct SceneState;
 
     public:
-        const Id &id() { return id_; }
+        const Id &id() const { return id_; }
         Buffer &vertex_buffer() { return vertex_buffer_; }
         Buffer &index_buffer() { return index_buffer_; }
         uint32_t num_vertices() const { return num_vertices_; }
@@ -1181,7 +1256,7 @@ public:
             return *this;
         }
 
-        const Id &id() { return id_; }
+        const Id &id() const { return id_; }
         const glm::fvec3 &translation() const { return translation_; }
         const glm::fvec3 &scale() const { return scale_; }
         const glm::fquat &rotation() const { return rotation_; }
@@ -1206,7 +1281,7 @@ public:
         void set_mesh_id(const StaticMesh::Id &mesh_id) { mesh_id_ = mesh_id; }
     };
 
-    enum DescriptorSet { PerFrame, PerObject, Count };
+    enum DescriptorSet { PerFrame, PerMaterial, PerObject, Count };
     struct FrameSubmitData final {
     private:
         ProgramState &state_;
@@ -1216,14 +1291,12 @@ public:
         VkSemaphore sem_image_avaliable_, sem_render_done_;
         VkFence fence_in_flight_;
 
-        std::array<VkDescriptorSet, DescriptorSet::Count> descriptor_sets_;
+        VkDescriptorSet per_frame_set_;
         Buffer per_frame_buffer_;
 
         FrameSubmitData(ProgramState &state, SceneState &scene)
             : state_{state}, scene_{scene}, command_buffer_{VK_NULL_HANDLE}, sem_image_avaliable_{VK_NULL_HANDLE},
-              sem_render_done_{VK_NULL_HANDLE}, fence_in_flight_{VK_NULL_HANDLE} {
-            descriptor_sets_.fill(VK_NULL_HANDLE);
-        }
+              sem_render_done_{VK_NULL_HANDLE}, fence_in_flight_{VK_NULL_HANDLE}, per_frame_set_{VK_NULL_HANDLE} {}
 
     public:
         VkCommandBuffer command_buffer() { return command_buffer_; }
@@ -1245,14 +1318,14 @@ public:
             sem_image_avaliable_ = f.sem_image_avaliable_;
             sem_render_done_ = f.sem_render_done_;
             fence_in_flight_ = f.fence_in_flight_;
-            descriptor_sets_ = std::move(f.descriptor_sets_);
+            per_frame_set_ = std::move(f.per_frame_set_);
             per_frame_buffer_ = std::move(f.per_frame_buffer_);
 
             f.command_buffer_ = VK_NULL_HANDLE;
             f.sem_image_avaliable_ = VK_NULL_HANDLE;
             f.sem_render_done_ = VK_NULL_HANDLE;
             f.fence_in_flight_ = VK_NULL_HANDLE;
-            f.descriptor_sets_.fill(VK_NULL_HANDLE);
+            f.per_frame_set_ = VK_NULL_HANDLE;
         }
 
         ~FrameSubmitData() {
@@ -1280,6 +1353,9 @@ private:
     VkDescriptorPool descriptor_pool_;
     std::array<VkDescriptorSetLayout, DescriptorSet::Count> descriptor_layout_;
 
+    VkDescriptorSet per_object_set_;
+
+    // swapchain images
     std::vector<VkImage> swapchain_images_;
     std::vector<VkImageView> swapchain_views_;
     std::vector<VkFramebuffer> swapchain_fbs_;
@@ -1287,6 +1363,7 @@ private:
 
     std::array<std::optional<SceneObject>, kMaxObjects> scene_objects_;
     std::array<std::optional<StaticMesh>, kMaxStaticMeshes> static_meshes_;
+    std::array<std::optional<Material>, kMaxMaterials> materials_;
 
     Image depth_image_;
     std::optional<Image::View> depth_view_;
@@ -1401,6 +1478,12 @@ public:
         }
     }
 
+    template <typename F> void with_material(const Material::Id &id, F f) {
+        if (id.valid()) {
+            f(*materials_[id.id_]);
+        }
+    }
+
     SceneObject::Id create_scene_object() {
         auto iter = std::find_if(scene_objects_.begin(), scene_objects_.end(), [&](const auto &slot) { return !slot; });
         if (iter == scene_objects_.end()) {
@@ -1414,7 +1497,7 @@ public:
         return id;
     }
 
-    StaticMesh::Id upload_static_mesh(const Geometry &geometry) {
+    StaticMesh::Id create_static_mesh(const Geometry &geometry) {
         // find empty slot for this mesh
         auto iter = std::find_if(static_meshes_.begin(), static_meshes_.end(), [&](const auto &slot) { return !slot; });
         if (iter == static_meshes_.end()) {
@@ -1458,6 +1541,83 @@ public:
         auto id = StaticMesh::Id{static_cast<uint32_t>(std::distance(static_meshes_.begin(), iter))};
         iter->emplace(std::move(StaticMesh(id, std::move(*vertex_buffer), std::move(*index_buffer),
             static_cast<uint32_t>(geometry.vertices.size()), static_cast<uint32_t>(geometry.indices.size()))));
+
+        return id;
+    }
+
+    Material::Id create_material(const Bitmap &albedo_bitmap, VkFilter filter, VkSamplerAddressMode address_mode) {
+        auto iter = std::find_if(materials_.begin(), materials_.end(), [&](const auto &slot) { return !slot; });
+        if (iter == materials_.end()) {
+            LOG_ERROR("too many materials allocated, the limit is %lld", kMaxStaticMeshes);
+            return {};
+        }
+
+        auto image = memory_->create_image_rgba(
+            VK_IMAGE_USAGE_SAMPLED_BIT, albedo_bitmap.width, albedo_bitmap.height, albedo_bitmap.pixels.data());
+
+        if (!image) {
+            LOG_ERROR("failed to uplaod image to the gpu memory");
+            return {};
+        }
+
+        auto image_view = image->create_view(
+            state_.dispatch(), VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+
+        if (!image_view) {
+            LOG_ERROR("failed to create image view from uploaded image");
+            return {};
+        }
+
+        // create sampler
+        VkSamplerCreateInfo sampler_desc = {};
+        sampler_desc.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler_desc.magFilter = filter;
+        sampler_desc.minFilter = filter;
+        sampler_desc.addressModeU = address_mode;
+        sampler_desc.addressModeV = address_mode;
+        sampler_desc.addressModeW = address_mode;
+
+        VkResult res;
+        VkSampler sampler = VK_NULL_HANDLE;
+
+        res = state_.dispatch().createSampler(&sampler_desc, nullptr, &sampler);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to create sampler: %s", string_VkResult(res));
+            return {};
+        }
+
+        VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+
+        // create per material descriptor set
+        VkDescriptorSetAllocateInfo set_alloc_info = {};
+        set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        set_alloc_info.descriptorPool = descriptor_pool_;
+        set_alloc_info.descriptorSetCount = 1;
+        set_alloc_info.pSetLayouts = &descriptor_layout_[DescriptorSet::PerMaterial];
+
+        res = state_.dispatch().allocateDescriptorSets(&set_alloc_info, &descriptor_set);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to allocate per material descriptor set: %s", string_VkResult(res));
+            return {};
+        }
+
+        VkDescriptorImageInfo descriptor_image_info = {};
+        descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        descriptor_image_info.imageView = image_view->view();
+        descriptor_image_info.sampler = sampler;
+
+        VkWriteDescriptorSet per_material_write_set = {};
+        per_material_write_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        per_material_write_set.dstBinding = 0;
+        per_material_write_set.dstSet = descriptor_set;
+        per_material_write_set.descriptorCount = 1;
+        per_material_write_set.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        per_material_write_set.pImageInfo = &descriptor_image_info;
+
+        state_.dispatch().updateDescriptorSets(1, &per_material_write_set, 0, nullptr);
+
+        auto id = Material::Id{static_cast<uint32_t>(std::distance(materials_.begin(), iter))};
+        iter->emplace(Material(state_, id, std::move(*image), std::move(*image_view), sampler, descriptor_set));
 
         return id;
     }
@@ -1558,7 +1718,7 @@ public:
         state_.dispatch().cmdBeginRenderPass(frame.command_buffer_, &render_begin_desc, VK_SUBPASS_CONTENTS_INLINE);
         state_.dispatch().cmdBindPipeline(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_);
         state_.dispatch().cmdBindDescriptorSets(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline_layout_, 0, 1, &frame.descriptor_sets_[DescriptorSet::PerFrame], 0, nullptr);
+            pipeline_layout_, DescriptorSet::PerFrame, 1, &frame.per_frame_set_, 0, nullptr);
 
         // dynamic state
         VkViewport vp = {};
@@ -1596,7 +1756,7 @@ public:
             object_uniforms_->write_slot(ubo_slot, object_data, false);
 
             state_.dispatch().cmdBindDescriptorSets(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipeline_layout_, 1, 1, &frame.descriptor_sets_[DescriptorSet::PerObject], 1, &ubo_offset);
+                pipeline_layout_, DescriptorSet::PerObject, 1, &per_object_set_, 1, &ubo_offset);
             with_static_mesh(
                 object->mesh_id_, [&](StaticMesh &mesh) { mesh.draw(state_.dispatch(), frame.command_buffer()); });
         }
@@ -1743,17 +1903,19 @@ public:
     }
 
     static bool create_descriptor_data(ProgramState &state, SceneState &scene) {
-        VkDescriptorSetLayoutBinding per_frame_binding = {};
-        per_frame_binding.binding = 0;
-        per_frame_binding.descriptorCount = 1;
-        per_frame_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        per_frame_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        // layout of the per-frame descriptor set
+        std::array<VkDescriptorSetLayoutBinding, 1> per_frame_bindings = {};
+        per_frame_bindings[0] = {};
+        per_frame_bindings[0].binding = 0;
+        per_frame_bindings[0].descriptorCount = 1;
+        per_frame_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        per_frame_bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
         VkDescriptorSetLayoutCreateInfo per_frame_set_desc = {};
         per_frame_set_desc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        per_frame_set_desc.bindingCount = 1;
         per_frame_set_desc.flags = 0;
-        per_frame_set_desc.pBindings = &per_frame_binding;
+        per_frame_set_desc.bindingCount = static_cast<uint32_t>(per_frame_bindings.size());
+        per_frame_set_desc.pBindings = per_frame_bindings.data();
 
         VkResult res = state.dispatch().createDescriptorSetLayout(
             &per_frame_set_desc, nullptr, &scene.descriptor_layout_[DescriptorSet::PerFrame]);
@@ -1762,17 +1924,40 @@ public:
             return false;
         }
 
-        VkDescriptorSetLayoutBinding per_object_binding = {};
-        per_object_binding.binding = 0;
-        per_object_binding.descriptorCount = 1;
-        per_object_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-        per_object_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        // layout of the per-material descriptor set
+        std::array<VkDescriptorSetLayoutBinding, 1> per_material_bindings = {};
+        per_material_bindings[0] = {};
+        per_material_bindings[0].binding = 0;
+        per_material_bindings[0].descriptorCount = 1;
+        per_material_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        per_material_bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo per_material_set_desc = {};
+        per_material_set_desc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        per_material_set_desc.flags = 0;
+        per_material_set_desc.bindingCount = static_cast<uint32_t>(per_material_bindings.size());
+        per_material_set_desc.pBindings = per_material_bindings.data();
+
+        res = state.dispatch().createDescriptorSetLayout(
+            &per_material_set_desc, nullptr, &scene.descriptor_layout_[DescriptorSet::PerMaterial]);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to create descriptor set layout: %s", string_VkResult(res));
+            return false;
+        }
+
+        // layout of the per-object descriptor set
+        std::array<VkDescriptorSetLayoutBinding, 1> per_object_bindings = {};
+        per_object_bindings[0] = {};
+        per_object_bindings[0].binding = 0;
+        per_object_bindings[0].descriptorCount = 1;
+        per_object_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        per_object_bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
         VkDescriptorSetLayoutCreateInfo per_object_set_desc = {};
         per_object_set_desc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        per_object_set_desc.bindingCount = 1;
         per_object_set_desc.flags = 0;
-        per_object_set_desc.pBindings = &per_object_binding;
+        per_object_set_desc.bindingCount = static_cast<uint32_t>(per_object_bindings.size());
+        per_object_set_desc.pBindings = per_object_bindings.data();
 
         res = state.dispatch().createDescriptorSetLayout(
             &per_object_set_desc, nullptr, &scene.descriptor_layout_[DescriptorSet::PerObject]);
@@ -1783,9 +1968,10 @@ public:
 
         // allocate descriptor pool
         // clang-format off
-        std::array<VkDescriptorPoolSize, 2> pool_sizes = {
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 50},
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 50}
+        std::array<VkDescriptorPoolSize, 3> pool_sizes = {
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 10},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 10},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 10}
         };
         // clang-format on
 
@@ -1990,6 +2176,43 @@ public:
         return true;
     }
 
+    static bool create_object_data(ProgramState &state, SceneState &scene, uint32_t frames_in_flight) {
+        scene.object_uniforms_ = scene.memory_->init_dynamic_ubo<cbPerObject>(kMaxObjects * frames_in_flight);
+        if (!scene.object_uniforms_) {
+            LOG_ERROR("failed to allocate dynamic uniform buffer");
+            return false;
+        }
+
+        // create per object descriptor set
+        VkDescriptorSetAllocateInfo set_alloc_info = {};
+        set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        set_alloc_info.descriptorPool = scene.descriptor_pool_;
+        set_alloc_info.descriptorSetCount = 1;
+        set_alloc_info.pSetLayouts = &scene.descriptor_layout_[DescriptorSet::PerObject];
+
+        VkResult res = state.dispatch().allocateDescriptorSets(&set_alloc_info, &scene.per_object_set_);
+        if (VK_SUCCESS != res) {
+            LOG_ERROR("failed to allocate per object descriptor set: %s", string_VkResult(res));
+            return false;
+        }
+
+        VkDescriptorBufferInfo per_object_buffer_desc = {};
+        per_object_buffer_desc.buffer = scene.object_uniforms_->buffer().buffer();
+        per_object_buffer_desc.offset = 0;
+        per_object_buffer_desc.range = sizeof(cbPerFrame);
+
+        VkWriteDescriptorSet per_object_write_set = {};
+        per_object_write_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        per_object_write_set.dstBinding = 0;
+        per_object_write_set.dstSet = scene.per_object_set_;
+        per_object_write_set.descriptorCount = 1;
+        per_object_write_set.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        per_object_write_set.pBufferInfo = &per_object_buffer_desc;
+
+        state.dispatch().updateDescriptorSets(1, &per_object_write_set, 0, nullptr);
+        return true;
+    }
+
     static bool create_frame_data(ProgramState &state, SceneState &scene, uint32_t frames_in_flight) {
         VkResult res;
 
@@ -2053,12 +2276,12 @@ public:
             VkDescriptorSetAllocateInfo set_alloc_info = {};
             set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
             set_alloc_info.descriptorPool = scene.descriptor_pool_;
-            set_alloc_info.descriptorSetCount = DescriptorSet::Count;
-            set_alloc_info.pSetLayouts = scene.descriptor_layout_.data();
+            set_alloc_info.descriptorSetCount = 1;
+            set_alloc_info.pSetLayouts = &scene.descriptor_layout_[DescriptorSet::PerFrame];
 
-            res = state.dispatch().allocateDescriptorSets(&set_alloc_info, frame.descriptor_sets_.data());
+            res = state.dispatch().allocateDescriptorSets(&set_alloc_info, &frame.per_frame_set_);
             if (VK_SUCCESS != res) {
-                LOG_ERROR("failed to allocate descriptor sets: %s", string_VkResult(res));
+                LOG_ERROR("failed to allocate per frame descriptor set: %s", string_VkResult(res));
                 return false;
             }
 
@@ -2068,30 +2291,15 @@ public:
             per_frame_buffer_desc.offset = 0;
             per_frame_buffer_desc.range = sizeof(cbPerFrame);
 
-            VkDescriptorBufferInfo per_object_buffer_desc = {};
-            per_object_buffer_desc.buffer = scene.object_uniforms_->buffer().buffer();
-            per_object_buffer_desc.offset = 0;
-            per_object_buffer_desc.range = sizeof(cbPerFrame);
+            VkWriteDescriptorSet per_frame_write_set = {};
+            per_frame_write_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            per_frame_write_set.dstBinding = 0;
+            per_frame_write_set.dstSet = frame.per_frame_set_;
+            per_frame_write_set.descriptorCount = 1;
+            per_frame_write_set.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            per_frame_write_set.pBufferInfo = &per_frame_buffer_desc;
 
-            std::array<VkWriteDescriptorSet, 2> write_sets;
-            write_sets[DescriptorSet::PerFrame] = {};
-            write_sets[DescriptorSet::PerFrame].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            write_sets[DescriptorSet::PerFrame].dstBinding = 0;
-            write_sets[DescriptorSet::PerFrame].dstSet = frame.descriptor_sets_[DescriptorSet::PerFrame];
-            write_sets[DescriptorSet::PerFrame].descriptorCount = 1;
-            write_sets[DescriptorSet::PerFrame].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            write_sets[DescriptorSet::PerFrame].pBufferInfo = &per_frame_buffer_desc;
-
-            write_sets[DescriptorSet::PerObject] = {};
-            write_sets[DescriptorSet::PerObject].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            write_sets[DescriptorSet::PerObject].dstBinding = 0;
-            write_sets[DescriptorSet::PerObject].dstSet = frame.descriptor_sets_[DescriptorSet::PerObject];
-            write_sets[DescriptorSet::PerObject].descriptorCount = 1;
-            write_sets[DescriptorSet::PerObject].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-            write_sets[DescriptorSet::PerObject].pBufferInfo = &per_object_buffer_desc;
-
-            state.dispatch().updateDescriptorSets(
-                static_cast<uint32_t>(write_sets.size()), write_sets.data(), 0, nullptr);
+            state.dispatch().updateDescriptorSets(1, &per_frame_write_set, 0, nullptr);
         }
 
         return true;
@@ -2108,14 +2316,6 @@ public:
 
         scene->memory_ = std::move(memory);
         LOG_INFO("initialized memory helper");
-
-        auto object_uniforms = scene->memory_->init_dynamic_ubo<cbPerObject>(kMaxObjects * kFramesInFlight);
-        if (!object_uniforms) {
-            LOG_ERROR("failed to allocate dynamic uniform buffer");
-            return {};
-        }
-
-        scene->object_uniforms_ = std::move(object_uniforms);
 
         if (!create_render_pass(state, &scene->render_pass_)) {
             LOG_ERROR("failed to create render pass");
@@ -2158,6 +2358,13 @@ public:
         }
 
         LOG_INFO("created command pool");
+
+        if (!create_object_data(state, *scene, kFramesInFlight)) {
+            LOG_ERROR("failed to create object buffers");
+            return {};
+        }
+
+        LOG_INFO("created per-object uniform buffer");
 
         if (!create_frame_data(state, *scene, kFramesInFlight)) {
             LOG_ERROR("failed to create frame submission data");
@@ -2308,7 +2515,7 @@ return Geometry{
         auto geometry = cube_geometry();
 
         // upload meshes
-        auto cube_mesh = scene.upload_static_mesh(geometry);
+        auto cube_mesh = scene.create_static_mesh(geometry);
         if (!cube_mesh.valid()) {
             LOG_ERROR("failed to upload cube mesh");
             return {};
