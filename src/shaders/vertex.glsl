@@ -13,8 +13,12 @@ layout(set = 0, binding = 0) uniform CbPerFrame {
     mat4 proj;
 } cbPerFrame;
 
+layout(set = 1, binding = 0) uniform CbPerObject {
+    mat4 world;
+} cbPerObject;
+
 void main() {
-    vec4 world_pos = vec4(in_position, 1.0);
+    vec4 world_pos = cbPerObject.world * vec4(in_position, 1.0);
 
     out_position = world_pos.xyz;
     out_normal = in_normal;
