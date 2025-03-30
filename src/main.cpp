@@ -2179,7 +2179,7 @@ private:
 
     Geometry cube_geometry_;
     SceneState::StaticMesh::Id cube_mesh_;
-    SceneState::SceneObject::Id cube_object_;
+    SceneState::SceneObject::Id cube_object_, test_object_;
 
     cbPerFrame per_frame_;
     Clock::time_point last_time_;
@@ -2214,7 +2214,11 @@ public:
 
         // animate objects
         scene_.with_object(cube_object_, [&](SceneState::SceneObject &object) {
-            object.set_rotation(glm::angleAxis(time_elapsed_ * 0.5f * glm::pi<float>(), glm::fvec3{0.0f, 1.0f, 0.0f}));
+            object.set_rotation(glm::angleAxis(time_elapsed_ * +0.5f * glm::pi<float>(), glm::fvec3{0.0f, 1.0f, 0.0f}));
+        });
+
+        scene_.with_object(test_object_, [&](SceneState::SceneObject &object) {
+            object.set_rotation(glm::angleAxis(time_elapsed_ * -1.0f * glm::pi<float>(), glm::fvec3{0.0f, 0.0f, 1.0f}));
         });
 
         // update camera
@@ -2311,18 +2315,21 @@ return Geometry{
         }
 
         auto cube_object = scene.create_scene_object();
-        if (!cube_object.valid()) {
-            LOG_ERROR("failed to create cube object");
-            return {};
-        }
+        auto test_object = scene.create_scene_object();
 
         scene.with_object(cube_object, [&](SceneState::SceneObject &object) {
             object.set_translation(glm::fvec3{-2.5f, 0.0f, 0.0f});
             object.set_mesh_id(cube_mesh);
         });
 
+        scene.with_object(test_object, [&](SceneState::SceneObject &object) {
+            object.set_translation(glm::fvec3{+2.5f, 0.0f, 0.0f});
+            object.set_mesh_id(cube_mesh);
+        });
+
         sample->cube_mesh_ = cube_mesh;
         sample->cube_object_ = cube_object;
+        sample->test_object_ = test_object;
 
         return sample;
     }
