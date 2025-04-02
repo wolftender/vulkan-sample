@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(SOURCE_DIR ${CMAKE_SOURCE_DIR}/src)
 set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/out)
+set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/resources)
 
 set(PYTHON_EXECUTABLE py)
 
@@ -33,6 +34,10 @@ set(SHADER_LIST
     "${SOURCE_DIR}/shaders/fragment.glsl|fragment|${OUTPUT_DIR}/fragment.spv|fragment.h"
 )
 
+set(ASSETS_LIST
+    "${ASSETS_DIR}/bricks.png|bricks.h"
+)
+
 # generate shader compile command
 function(compile_shader SHADER_FILE TARGET OUTPUT_FILE HEADER_FILE)
     add_custom_command(
@@ -47,6 +52,17 @@ function(compile_shader SHADER_FILE TARGET OUTPUT_FILE HEADER_FILE)
     set(SHADER_OUTPUTS ${SHADER_OUTPUTS} ${OUTPUT_FILE} PARENT_SCOPE)
 endfunction()
 
+function(compile_asset ASSET_FILE HEADER_FILE)
+    SET(OUTPUT_FILE ${SOURCE_DIR}/resources/${HEADER_FILE})
+    add_custom_command(
+        OUTPUT ${OUTPUT_FILE}
+        COMMAND py ${CMAKE_SOURCE_DIR}/embed_file.py ${ASSET_FILE} ${OUTPUT_FILE}
+        COMMENT "Create binary asset: ${ASSET_FILE} -> ${OUTPUT_FILE}"
+        VERBATIM
+    )
+    set(ASSET_OUTPUTS ${ASSET_OUTPUTS} ${OUTPUT_FILE} PARENT_SCOPE)
+endfunction()
+
 # compile all shaders from SHADER_LIST
 set(SHADER_OUTPUTS "")
 foreach(SHADER_DATA ${SHADER_LIST})
@@ -58,8 +74,16 @@ foreach(SHADER_DATA ${SHADER_LIST})
     compile_shader(${SHADER_FILE} ${TARGET} ${OUTPUT_FILE} ${HEADER_FILE})
 endforeach()
 
+set(ASSET_OUTPUTS "")
+foreach(ASSET_DATA ${ASSETS_LIST})
+    string(REPLACE "|" ";" ASSET_PROPS ${ASSET_DATA})
+    list(GET ASSET_PROPS 0 ASSET_FILE)
+    list(GET ASSET_PROPS 1 ASSET_HEADER)
+    compile_asset(${ASSET_FILE} ${ASSET_HEADER})
+endforeach()
+
 # add executable
-add_executable(vkbtest ${SOURCE_FILES} ${SHADER_OUTPUTS})
+add_executable(vkbtest ${SOURCE_FILES} ${SHADER_OUTPUTS} ${ASSET_OUTPUTS})
 target_link_libraries(vkbtest glfw3)
 
 # linking

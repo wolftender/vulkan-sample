@@ -27,6 +27,7 @@
 
 #include <GLFW/glfw3.h>
 
+#define STB_IMAGE_IMPLEMENTATION
 #include "third_party/stb_image.h"
 #include "third_party/VkBootstrap.h"
 #include "third_party/VkBootstrapDispatch.h"
@@ -42,6 +43,7 @@
 // binary resources
 #include "resources/vertex.h"
 #include "resources/fragment.h"
+#include "resources/bricks.h"
 
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[error] at %s line %d " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[info] at %s line %d " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
@@ -493,7 +495,6 @@ public:
 };
 
 constexpr uint32_t kFramesInFlight = 2;
-constexpr uint32_t kStagingBufferSize = 64 * 1024;
 
 struct Vertex {
     glm::fvec3 position;
@@ -506,10 +507,25 @@ struct Geometry {
     std::vector<uint32_t> indices;
 };
 
-struct Bitmap {
-    uint32_t width;
-    uint32_t height;
-    std::vector<uint8_t> pixels;
+struct Bitmap final {
+private:
+    uint32_t width_;
+    uint32_t height_;
+    std::vector<uint8_t> pixels_;
+
+public:
+    uint32_t width() const { return width_; }
+    uint32_t height() const { return height_; }
+
+    const std::vector<uint8_t> &pixels() const { return pixels_; }
+    const uint8_t *raw_pixels() const { return pixels_.data(); }
+    uint32_t size() const { return pixels_.size(); }
+
+    uint8_t *raw_pixels() { return pixels_.data(); }
+
+    Bitmap(uint32_t width, uint32_t height) : width_{width}, height_{height} { pixels_.resize(width_ * height_ * 4); }
+    Bitmap(const Bitmap &) = default;
+    Bitmap &operator=(const Bitmap &) = default;
 };
 
 struct cbPerFrame {
@@ -525,7 +541,6 @@ struct MemoryHelper final {
 private:
     ProgramState &state_;
 
-    Buffer staging_buffer_;
     VkFence fence_complete_;
     VkCommandPool command_pool_;
     VkCommandBuffer command_buffer_;
@@ -579,21 +594,26 @@ public:
         VkResult res;
         VkDeviceSize image_size = width * height * 4;
 
+        // create staging buffer for transfer
+        auto staging_buffer = create_staging_buffer(image_size);
+        if (!staging_buffer) {
+            LOG_ERROR("failed to allocate staging buffer for transfer");
+            return {};
+        }
+
         // map the staging buffer and upload the raw pixels
         void *mapped_mem;
-        res = vmaMapMemory(state_.allocator(), staging_buffer_.allocation(), &mapped_mem);
+        res = vmaMapMemory(state_.allocator(), staging_buffer->allocation(), &mapped_mem);
         if (VK_SUCCESS != res) {
             LOG_ERROR("cannot map staging buffer: %s", string_VkResult(res));
             return {};
         }
 
         memcpy(mapped_mem, pixels, image_size);
-        if (!staging_buffer_.flush()) {
+        if (!staging_buffer->flush()) {
             LOG_ERROR("cannot flush staging buffer");
             return {};
         }
-
-        vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
 
         VkImageCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -655,7 +675,7 @@ public:
             image_copy.imageSubresource.layerCount = 1;
             image_copy.imageExtent = VkExtent3D{width, height, 1};
 
-            state_.dispatch().cmdCopyBufferToImage(command_buffer, staging_buffer_.buffer(), image.image(),
+            state_.dispatch().cmdCopyBufferToImage(command_buffer, staging_buffer->buffer(), image.image(),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
 
             // move the image to layout optimal for gpu rendering
@@ -674,6 +694,8 @@ public:
             return {};
         }
 
+        // remember to unmap before deallocation
+        vmaUnmapMemory(state_.allocator(), staging_buffer->allocation());
         return image;
     }
 
@@ -708,11 +730,6 @@ public:
     std::optional<Buffer> create_buffer(
         const VkBufferUsageFlags usage, const void *data, size_t byte_size, bool use_staging) const {
         VkResult res;
-
-        if (use_staging && kStagingBufferSize < byte_size) {
-            LOG_ERROR("requested device-only memory but staging buffer too small for the resource");
-            return {};
-        }
 
         VkBufferCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -780,20 +797,25 @@ public:
                 return {};
             }
         } else {
+            // prepare staging buffer for upload
+            auto staging_buffer = create_staging_buffer(byte_size);
+            if (!staging_buffer) {
+                LOG_ERROR("failed to allocate staging buffer for transfer");
+                return {};
+            }
+
             void *mapped_mem;
-            res = vmaMapMemory(state_.allocator(), staging_buffer_.allocation(), &mapped_mem);
+            res = vmaMapMemory(state_.allocator(), staging_buffer->allocation(), &mapped_mem);
             if (VK_SUCCESS != res) {
                 LOG_ERROR("cannot map staging buffer: %s", string_VkResult(res));
                 return {};
             }
 
             memcpy(mapped_mem, data, byte_size);
-            if (!staging_buffer_.flush()) {
+            if (!staging_buffer->flush()) {
                 LOG_ERROR("cannot flush staging buffer write");
                 return {};
             }
-
-            vmaUnmapMemory(state_.allocator(), staging_buffer_.allocation());
 
             // transfer command
             res = vmaFlushAllocation(state_.allocator(), buffer.allocation(), 0, VK_WHOLE_SIZE);
@@ -802,7 +824,8 @@ public:
                 return {};
             }
 
-            copy_buffer(staging_buffer_.buffer(), buffer.buffer(), byte_size);
+            copy_buffer(staging_buffer->buffer(), buffer.buffer(), byte_size);
+            vmaUnmapMemory(state_.allocator(), staging_buffer->allocation());
         }
 
         return std::move(buffer);
@@ -873,14 +896,12 @@ public:
         });
     }
 
-    static std::unique_ptr<MemoryHelper> initialize(ProgramState &state) {
-        std::unique_ptr<MemoryHelper> memory{new MemoryHelper(state)};
-
+    std::optional<Buffer> create_staging_buffer(VkDeviceSize size) const {
         // initialize staging buffer
         VkBufferCreateInfo staging_buffer_desc = {};
         staging_buffer_desc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         staging_buffer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        staging_buffer_desc.size = kStagingBufferSize;
+        staging_buffer_desc.size = size;
         staging_buffer_desc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         VmaAllocationCreateInfo staging_alloc_desc = {};
@@ -892,13 +913,18 @@ public:
         VmaAllocationInfo alloc_info = {};
 
         VkResult res = vmaCreateBuffer(
-            state.allocator(), &staging_buffer_desc, &staging_alloc_desc, &vk_buffer, &allocation, &alloc_info);
+            state_.allocator(), &staging_buffer_desc, &staging_alloc_desc, &vk_buffer, &allocation, &alloc_info);
         if (res != VK_SUCCESS) {
             LOG_ERROR("failed to allocate staging buffer: %s", string_VkResult(res));
             return {};
         }
 
-        memory->staging_buffer_ = Buffer{state.allocator(), vk_buffer, allocation, alloc_info};
+        return Buffer{state_.allocator(), vk_buffer, allocation, alloc_info};
+    }
+
+    static std::unique_ptr<MemoryHelper> initialize(ProgramState &state) {
+        std::unique_ptr<MemoryHelper> memory{new MemoryHelper(state)};
+        VkResult res;
 
         // initialize fence for completion
         VkFenceCreateInfo fence_desc = {};
@@ -1071,6 +1097,11 @@ public:
         }
 
         bool valid() const { return id_ != kInvalidId; }
+
+        operator bool() const { return valid(); }
+        bool operator<(const Identifier<T> &other) const { return id_ < other.id_; }
+        bool operator>(const Identifier<T> &other) const { return id_ > other.id_; }
+        bool operator==(const Identifier<T> &other) const { return id_ == other.id_; }
     };
 
     struct Material final {
@@ -1098,6 +1129,7 @@ public:
         Image::View &image_view() { return image_view_; }
         VkSampler sampler() { return sampler_; }
         VkDescriptorSet descriptor_set() { return descriptor_set_; }
+        const VkDescriptorSet *descriptor_set_addr() const { return &descriptor_set_; }
 
         ~Material() {
             if (state_ && sampler_ != VK_NULL_HANDLE) {
@@ -1217,6 +1249,7 @@ public:
 
         glm::fmat4x4 transform_;
         StaticMesh::Id mesh_id_;
+        Material::Id material_id_;
 
         SceneObject(const Id &id)
             : id_{id}, translation_{0.0f, 0.0f, 0.0f}, scale_{1.0f, 1.0f, 1.0f}, rotation_{0.0f, 0.0f, 0.0f, 1.0f},
@@ -1262,6 +1295,7 @@ public:
         const glm::fquat &rotation() const { return rotation_; }
         const glm::fmat4x4 &transform() const { return transform_; }
         const StaticMesh::Id &mesh_id() const { return mesh_id_; }
+        const Material::Id &material_id() const { return material_id_; }
 
         void set_translation(const glm::fvec3 &translation) {
             translation_ = translation;
@@ -1279,6 +1313,7 @@ public:
         }
 
         void set_mesh_id(const StaticMesh::Id &mesh_id) { mesh_id_ = mesh_id; }
+        void set_material_id(const Material::Id &material_id) { material_id_ = material_id; }
     };
 
     enum DescriptorSet { PerFrame, PerMaterial, PerObject, Count };
@@ -1553,7 +1588,7 @@ public:
         }
 
         auto image = memory_->create_image_rgba(
-            VK_IMAGE_USAGE_SAMPLED_BIT, albedo_bitmap.width, albedo_bitmap.height, albedo_bitmap.pixels.data());
+            VK_IMAGE_USAGE_SAMPLED_BIT, albedo_bitmap.width(), albedo_bitmap.height(), albedo_bitmap.raw_pixels());
 
         if (!image) {
             LOG_ERROR("failed to uplaod image to the gpu memory");
@@ -1742,9 +1777,35 @@ public:
 
         // render scene objects
         cbPerObject object_data;
+
+        std::array<const SceneObject *, kMaxObjects> render_queue;
+        auto render_queue_end = render_queue.begin();
         for (const auto &object : scene_objects_) {
-            if (!object || !object->mesh_id_.valid()) {
-                continue; // nothing to draw
+            // only render objects that are valid, have valid mesh and material
+            if (object && object->mesh_id().valid() && object->material_id().valid()) {
+                *render_queue_end = &object.value();
+                render_queue_end++;
+            }
+        }
+
+        // TODO: cache the order instead of recalculating each frame
+        // sort by material
+        std::sort(render_queue.begin(), render_queue_end, [&](const SceneObject *first, const SceneObject *second) {
+            return first->material_id() < second->material_id();
+        });
+
+        Material::Id current_material;
+        for (auto iter = render_queue.begin(); iter != render_queue_end; ++iter) {
+            const auto &object = *iter;
+
+            if (object->material_id() != current_material) {
+                current_material = object->material_id();
+
+                // bind material
+                with_material(current_material, [&](const Material &mat) {
+                    state_.dispatch().cmdBindDescriptorSets(frame.command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        pipeline_layout_, DescriptorSet::PerMaterial, 1, mat.descriptor_set_addr(), 0, nullptr);
+                });
             }
 
             // bind uniforms
@@ -2385,6 +2446,8 @@ private:
     SceneState &scene_;
 
     Geometry cube_geometry_;
+
+    SceneState::Material::Id material_;
     SceneState::StaticMesh::Id cube_mesh_;
     SceneState::SceneObject::Id cube_object_, test_object_;
 
@@ -2440,6 +2503,29 @@ public:
         frame.update_per_frame(per_frame_);
 
         return VK_SUCCESS;
+    }
+
+    static std::optional<Bitmap> load_png(const uint8_t *buffer, size_t size) {
+        int width, height, components;
+        int res = stbi_info_from_memory(buffer, size, &width, &height, &components);
+
+        if (0 == res) {
+            LOG_ERROR("cannot load png file: unsupported format");
+            return {};
+        }
+
+        Bitmap bitmap{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+        auto img = stbi_load_from_memory(buffer, size, &width, &height, &components, 4);
+        if (!img) {
+            LOG_ERROR("failed to load png image");
+            return {};
+        }
+
+        // since we passed 4 components as req, we can safely assume its fine now
+        memcpy(bitmap.raw_pixels(), img, width * height * 4);
+
+        stbi_image_free(img);
+        return std::move(bitmap);
     }
 
     static Geometry cube_geometry() {
@@ -2511,6 +2597,19 @@ return Geometry{
     static std::unique_ptr<VulkanSample> initialize(ProgramState &state, SceneState &scene) {
         std::unique_ptr<VulkanSample> sample{new VulkanSample(state, scene)};
 
+        // load material
+        auto bitmap = load_png(kBricks_png.data(), kBricks_png.size());
+        if (!bitmap) {
+            LOG_ERROR("failed to load png image bricks.png");
+            return {};
+        }
+
+        auto material = scene.create_material(bitmap.value(), VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT);
+        if (!material.valid()) {
+            LOG_ERROR("failed to create material for bricks.png");
+            return {};
+        }
+
         // create geometry and upload to a gram buffer
         auto geometry = cube_geometry();
 
@@ -2527,13 +2626,16 @@ return Geometry{
         scene.with_object(cube_object, [&](SceneState::SceneObject &object) {
             object.set_translation(glm::fvec3{-2.5f, 0.0f, 0.0f});
             object.set_mesh_id(cube_mesh);
+            object.set_material_id(material);
         });
 
         scene.with_object(test_object, [&](SceneState::SceneObject &object) {
             object.set_translation(glm::fvec3{+2.5f, 0.0f, 0.0f});
             object.set_mesh_id(cube_mesh);
+            object.set_material_id(material);
         });
 
+        sample->material_ = material;
         sample->cube_mesh_ = cube_mesh;
         sample->cube_object_ = cube_object;
         sample->test_object_ = test_object;
