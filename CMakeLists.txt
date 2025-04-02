@@ -84,6 +84,10 @@ endforeach()
 
 # add executable
 add_executable(vkbtest ${SOURCE_FILES} ${SHADER_OUTPUTS} ${ASSET_OUTPUTS})
+
+# use statically linked runtime on windows
+set_property(TARGET vkbtest PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded) # /MT
+
 target_link_libraries(vkbtest glfw3)
 
 # linking
